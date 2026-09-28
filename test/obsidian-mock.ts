@@ -39,7 +39,13 @@ export class Modal {
   close(): void {}
 }
 
-export class PluginSettingTab {}
+export class PluginSettingTab {
+  updates = 0;
+  constructor(public app: unknown, public plugin: unknown) {}
+  update(): void {
+    this.updates++;
+  }
+}
 export class Setting {}
 export function setIcon(): void {}
 

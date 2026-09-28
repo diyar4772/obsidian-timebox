@@ -6,6 +6,7 @@ import * as assert from "assert";
 import { Editor, MarkdownView, Notice, TFile } from "obsidian";
 import TimeboxPlugin from "../src/main";
 import { TopicModal } from "../src/ui/topic-modal";
+import { DEFAULT_SETTINGS, TimeboxSettingTab } from "../src/settings";
 
 (globalThis as any).window = { setInterval: () => 0 };
 
@@ -361,6 +362,38 @@ test("a session started in a callout at the end of the note renders as a bar", a
   renderBlock("C.md", source, { text, lineStart: 0, lineEnd: lines.length - 1 });
   assert.equal(rendered[0].result.ok, true, text);
   assert.equal(plugin.active.length, 1);
+});
+
+test("declarative settings: every setting is defined, and saving keeps the active list", async () => {
+  const { plugin, app } = await setup({ "A.md": "" });
+  plugin.active.push({ path: "A.md", start: "2026-09-28 10:00:00", topic: "x", mode: "simple" });
+  await plugin.saveSettings();
+  const tab: any = new TimeboxSettingTab(app, plugin);
+
+  // every settings key has a control (keeps getSettingDefinitions in sync with the settings)
+  const keys: string[] = [];
+  const walk = (items: any[]) => items.forEach((i) => (i.items ? walk(i.items) : i.control && keys.push(i.control.key)));
+  walk(tab.getSettingDefinitions());
+  assert.deepEqual([...keys].sort(), Object.keys(DEFAULT_SETTINGS).sort());
+
+  await tab.setControlValue("work", 50);
+  await tab.setControlValue("defaultMode", "pomodoro");
+  assert.equal(tab.getControlValue("work"), 50);
+  assert.equal(plugin.data.settings.work, 50);
+  assert.equal(plugin.data.settings.defaultMode, "pomodoro");
+  assert.equal(plugin.data.active.length, 1, "the active list survives a settings change");
+
+  // invalid values never reach the stored settings
+  await tab.setControlValue("short", 0);
+  await tab.setControlValue("defaultMode", "nonsense");
+  assert.equal(plugin.settings.short, 5);
+  assert.equal(plugin.settings.defaultMode, "simple");
+
+  // number validation messages
+  const work = tab.getSettingDefinitions()[2].items[1].control;
+  assert.equal(work.validate(25), undefined);
+  assert.match(work.validate(2.5), /whole number/);
+  assert.match(work.validate(601), /whole number/);
 });
 
 (async () => {

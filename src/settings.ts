@@ -1,4 +1,5 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import type { SettingDefinitionItem } from "obsidian";
 import type { PomodoroConfig, SessionMode } from "./core";
 import type TimeboxPlugin from "./main";
 
@@ -61,6 +62,112 @@ export class TimeboxSettingTab extends PluginSettingTab {
   constructor(app: App, private plugin: TimeboxPlugin) {
     super(app, plugin);
   }
+
+  // ───────────── Obsidian 1.13+: declarative settings (also indexed by the settings search) ─────────────
+  // Obsidian calls getSettingDefinitions() and skips display(); older versions only call display().
+  // Keep both in sync when adding or changing a setting.
+
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    const minutes = (value: number) =>
+      Number.isInteger(value) && value >= 1 && value <= MAX_MINUTES ? undefined : `Enter a whole number from 1 to ${MAX_MINUTES}.`;
+    const number = (key: "work" | "short" | "long" | "longEvery") => ({
+      type: "number" as const,
+      key,
+      min: 1,
+      max: MAX_MINUTES,
+      step: 1,
+      defaultValue: DEFAULT_SETTINGS[key],
+      validate: minutes,
+    });
+    return [
+      {
+        name: "Default mode",
+        desc: "Mode used when you start a session from the command palette or the ribbon icon.",
+        control: {
+          type: "dropdown",
+          key: "defaultMode",
+          defaultValue: DEFAULT_SETTINGS.defaultMode,
+          options: { simple: "Simple (time only)", pomodoro: "Pomodoro" },
+        },
+      },
+      {
+        name: "Finish previous session on start",
+        desc: "When you start a new session, any open session is finished at the current time.",
+        control: { type: "toggle", key: "autoStopPrevious" },
+      },
+      {
+        type: "group",
+        heading: "Pomodoro",
+        items: [
+          {
+            name: "How phases work",
+            desc:
+              "The phase is calculated from the time elapsed since the session started. If you change these " +
+              "durations, the phases of running pomodoro sessions are recalculated with the new values.",
+            searchable: false,
+          },
+          { name: "Focus duration", desc: "Length of one pomodoro, in minutes.", control: number("work") },
+          { name: "Short break", desc: "Length of a short break, in minutes.", control: number("short") },
+          { name: "Long break", desc: "Length of a long break, in minutes.", control: number("long") },
+          {
+            name: "Long break interval",
+            desc: "Take a long break instead of a short one after this many pomodoros.",
+            control: number("longEvery"),
+          },
+        ],
+      },
+      {
+        type: "group",
+        heading: "Alerts",
+        items: [
+          {
+            name: "Sound",
+            desc: "Play a short beep when the pomodoro phase changes.",
+            control: { type: "toggle", key: "sound" },
+          },
+          {
+            name: "System notification",
+            desc: notificationsSupported()
+              ? "Also show an operating system notification when the phase changes (asks for permission)."
+              : "System notifications aren't supported on this device.",
+            control: { type: "toggle", key: "systemNotification", disabled: !notificationsSupported() },
+          },
+        ],
+      },
+      {
+        type: "group",
+        heading: "Appearance",
+        items: [
+          {
+            name: "Status bar",
+            desc: "Show the active session in the status bar. Click it to open the session's note.",
+            control: { type: "toggle", key: "statusBar" },
+          },
+        ],
+      },
+    ];
+  }
+
+  getControlValue(key: string): unknown {
+    return (this.plugin.settings as unknown as Record<string, unknown>)[key];
+  }
+
+  /** Saves through the plugin so data.json keeps its active-session list (the default would save only the settings). */
+  async setControlValue(key: string, value: unknown): Promise<void> {
+    if (key === "systemNotification" && value === true && notificationsSupported() && Notification.permission !== "granted") {
+      const result = await Notification.requestPermission();
+      if (result !== "granted") {
+        new Notice("Permission for system notifications was not granted.");
+        // Show the toggle as off again. update() exists on 1.13+, the only version that calls this method.
+        (this as { update?: () => void }).update?.();
+        return;
+      }
+    }
+    this.plugin.settings = sanitizeSettings({ ...this.plugin.settings, [key]: value });
+    await this.plugin.saveSettings();
+  }
+
+  // ───────────── Obsidian < 1.13: imperative settings ─────────────
 
   display(): void {
     const { containerEl } = this;

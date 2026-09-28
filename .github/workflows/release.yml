@@ -10,6 +10,9 @@ on:
 
 permissions:
   contents: write
+  # for signed build provenance (artifact attestations) of the release assets
+  id-token: write
+  attestations: write
 
 jobs:
   build:
@@ -23,6 +26,13 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
       - name: Create draft release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
