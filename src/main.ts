@@ -13,6 +13,7 @@ import {
   findBlocks,
   formatStamp,
   formatTimer,
+  isUnclosedAtEnd,
   parseBlock,
   parseStamp,
   planFinish,
@@ -65,7 +66,7 @@ export default class TimeboxPlugin extends Plugin {
       let result: ParseResult = parseBlock(source, dayOf);
       // A fence that is never closed runs to the end of the note: it renders, but can't be finished.
       const info = typeof ctx.getSectionInfo === "function" ? ctx.getSectionInfo(el) : null;
-      if (result.ok && info && runsToEndUnclosed(info.text, info.lineStart, info.lineEnd)) {
+      if (result.ok && info && isUnclosedAtEnd(info.text, info.lineStart, info.lineEnd, source, dayOf)) {
         result = { ok: false, error: "This block has no closing fence. Add a line with ``` below it." };
       }
       // Blocks from non-markdown sources (e.g. Canvas cards) can't be located in a file; don't track them.
@@ -470,14 +471,6 @@ export default class TimeboxPlugin extends Plugin {
       await this.app.workspace.getLeaf(false).openFile(file);
     }
   }
-}
-
-/** Whether a code block section is an opening fence that is never closed before the end of the note. */
-function runsToEndUnclosed(text: string, lineStart: number, lineEnd: number): boolean {
-  const lines = text.split("\n");
-  if (lineEnd < lines.length - 1) return false; // the section ends before the last line
-  if (lineEnd <= lineStart) return true;
-  return !/^(?:[ \t]*>)*[ \t]*(`{3,}|~{3,})[ \t]*\r?$/.test(lines[lineEnd]);
 }
 
 function isActiveEntry(x: unknown): x is ActiveEntry {

@@ -337,11 +337,6 @@ interface Fence {
 const RE_FENCE_OPEN = /^((?:[ \t]*>)*)([ \t]*)(`{3,}|~{3,})(.*)$/;
 const RE_QUOTE_MARKER = /^[ \t]*>/;
 const RE_LIST_ITEM = /^([ \t]*)([-*+]|\d{1,9}[.)])([ \t]+|$)/;
-/**
- * How far up to look for the list item that owns an indented fence. Bounded so pathological
- * notes stay fast; a fence more than this many lines below its list item is treated as top-level.
- */
-const LIST_LOOKBACK = 1000;
 
 /** Splits on LF, remembering which lines ended with CR so mixed line endings survive edits. */
 function splitLines(text: string): { lines: string[]; cr: boolean[] } {
@@ -426,27 +421,43 @@ function lineInfoCache(lines: string[]): (depth: number, k: number) => LineInfo 
   };
 }
 
+type ListOwnerFinder = (depth: number, fromLine: number, indent: number) => number;
+
 /**
- * For a fence indented by `indent` columns, finds the content column of the list item it
- * belongs to (looking a limited number of lines up), or -1 if it isn't in a list.
+ * Returns a function that, for content indented by `indent` columns at quote depth `depth`,
+ * walks up from `fromLine` to find the content column of the list item it belongs to (-1 if
+ * none). Results are memoized per (depth, indent, line), so all lookups in a note together
+ * take time linear in its length.
  */
-function listContainerColumn(
-  info: (depth: number, k: number) => LineInfo,
-  openLine: number,
-  depth: number,
-  indent: number
-): number {
-  for (let k = openLine - 1; k >= 0 && k >= openLine - LIST_LOOKBACK; k--) {
-    const l = info(depth, k);
-    if (l.outside) return -1;
-    if (l.blank) continue;
-    if (l.listCol >= 0) {
-      if (l.listCol <= indent && indent - l.listCol <= 3) return l.listCol;
-      continue; // a deeper or shallower sibling item; keep looking for the owner
+function listOwnerFinder(info: (depth: number, k: number) => LineInfo): ListOwnerFinder {
+  const memo = new Map<string, number[]>();
+  return (depth, fromLine, indent) => {
+    const key = depth + ":" + indent;
+    let known = memo.get(key);
+    if (!known) memo.set(key, (known = []));
+    const visited: number[] = [];
+    let result = -1;
+    for (let k = fromLine; k >= 0; k--) {
+      if (known[k] !== undefined) {
+        result = known[k];
+        break;
+      }
+      visited.push(k);
+      const l = info(depth, k);
+      if (l.outside) break; // the quote ended: not in a list at this depth
+      if (l.blank) continue;
+      if (l.listCol >= 0) {
+        if (l.listCol <= indent && indent - l.listCol <= 3) {
+          result = l.listCol;
+          break;
+        }
+        continue; // a deeper or shallower sibling item; keep looking for the owner
+      }
+      if (l.lead === 0) break; // plain top-level text: not inside a list
     }
-    if (l.lead === 0) return -1; // plain top-level text: not inside a list
-  }
-  return -1;
+    for (const k of visited) known[k] = result;
+    return result;
+  };
 }
 
 /**
@@ -460,7 +471,7 @@ function listContainerColumn(
  */
 function scanFences(lines: string[]): Fence[] {
   const out: Fence[] = [];
-  const lineInfo = lineInfoCache(lines);
+  const listOwner = listOwnerFinder(lineInfoCache(lines));
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(RE_FENCE_OPEN);
     if (!m) continue;
@@ -475,7 +486,7 @@ function scanFences(lines: string[]): Fence[] {
     const indent = indentWidth(afterQuote);
     let container = 0;
     if (indent > 0) {
-      container = listContainerColumn(lineInfo, i, depth, indent);
+      container = listOwner(depth, i - 1, indent);
       if (container < 0) {
         if (indent >= 4) continue; // indented code block, not a fence
         container = 0;
@@ -631,7 +642,10 @@ export function planInsert(text: string, cursorLine: number, block: string): Ins
       // closed implicitly by the end of its quote or list item: go below it, in the
       // container of the first line after it (never back inside the open code block)
       anchor = f.closeLine - 1;
-      prefix = quotePrefixOf(lines[f.closeLine]);
+      const after = lines[f.closeLine];
+      const quote = quotePrefixOf(after);
+      const lead = after.slice(quote.length).match(/^[ \t]*/)![0];
+      prefix = quote + " ".repeat(indentWidth(lead));
     } else {
       // never closed: it runs to the end of the note, so put the block above it
       const p = quotePrefixOf(lines[f.openLine]);
@@ -650,7 +664,14 @@ export function planInsert(text: string, cursorLine: number, block: string): Ins
   const current = lines[anchor];
   if (prefix === null) {
     const quote = quotePrefixOf(current);
-    const col = listContentColumn(current.slice(quote.length));
+    const inner = current.slice(quote.length);
+    let col = listContentColumn(inner);
+    if (col < 0 && inner.trim() === "") {
+      // an indented blank line inside a list item: stay in that item
+      const w = indentWidth(inner);
+      const depth = (quote.match(/>/g) ?? []).length;
+      if (w > 0) col = listOwnerFinder(lineInfoCache(lines))(depth, anchor - 1, w);
+    }
     prefix = quote + (col > 0 ? " ".repeat(col) : "");
   }
   const blockLines = block.split("\n").map((l) => prefix + l);
@@ -693,7 +714,32 @@ export function applyInsert(text: string, plan: InsertPlan): string {
     for (let i = 0; i < pos.line; i++) n += raw[i].length + 1;
     return n + pos.ch;
   };
-  return text.slice(0, offset(plan.from)) + plan.text + text.slice(offset(plan.to));
+  // CRLF text: insert before the line's CR and use CRLF for the new lines too
+  const crlf = raw[plan.from.line]?.endsWith("\r") ?? false;
+  const insert = crlf ? plan.text.replace(/\n/g, "\r\n") : plan.text;
+  return text.slice(0, offset(plan.from)) + insert + text.slice(offset(plan.to));
+}
+
+/**
+ * For the code block processor: whether the `timebox` block rendered from `source` inside the
+ * section [lineStart, lineEnd] of `docText` is a fence that is never closed before the end of the
+ * note (such a block renders, but can't be found or finished). The block is located by scanning
+ * the whole note, so this doesn't depend on how large the section is (for a block inside a
+ * callout or list the section is the whole container). Returns false if it can't be identified.
+ */
+export function isUnclosedAtEnd(docText: string, lineStart: number, lineEnd: number, source: string, dayOf?: Date): boolean {
+  const { lines } = splitLines(docText);
+  const inSection = scanFences(lines).filter(
+    (f) => f.lang === BLOCK_LANG && f.openLine >= lineStart && f.openLine <= lineEnd
+  );
+  const want = parseBlock(source, dayOf);
+  const key = want.ok ? formatStamp(want.session.start) : null;
+  const match =
+    inSection.find((f) => {
+      const p = parseBlock(f.body.join("\n"), dayOf);
+      return key !== null && p.ok && formatStamp(p.session.start) === key;
+    }) ?? (inSection.length === 1 ? inSection[0] : undefined);
+  return !!match && !match.closed && match.closeLine >= lines.length;
 }
 
 /**

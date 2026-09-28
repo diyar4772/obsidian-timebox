@@ -339,6 +339,30 @@ test("starting inside a code block closed by its callout puts the session outsid
   assert.equal(plugin.active[0].topic, "T");
 });
 
+test("valid blocks in a callout or list at the end of the note render as bars (section = container)", async () => {
+  const { plugin, renderBlock, rendered } = await setup({ "N.md": "" });
+  const callout = "# N\n> [!note]\n> ```timebox\n> start: 2026-09-28 10:00\n> ```\n> some text";
+  renderBlock("N.md", "start: 2026-09-28 10:00", { text: callout, lineStart: 1, lineEnd: 5 });
+  const list = "- a\n  ```timebox\n  start: 2026-09-28 11:00\n  ```\n- b";
+  renderBlock("N.md", "start: 2026-09-28 11:00", { text: list, lineStart: 0, lineEnd: 4 });
+  assert.equal(rendered[0].result.ok, true);
+  assert.equal(rendered[1].result.ok, true);
+  assert.equal(plugin.active.length, 2);
+});
+
+test("a session started in a callout at the end of the note renders as a bar", async () => {
+  modalAnswer = "T";
+  const { plugin, views, renderBlock, rendered } = await setup({ "C.md": "> [!note] Title\n> body" }, ["C.md"]);
+  views[0].editor.cursor = { line: 0, ch: 3 };
+  await plugin.startFromEditor(views[0].editor, views[0], "simple");
+  const text = views[0].editor.getValue();
+  const lines = text.split("\n");
+  const source = lines.filter((l) => /^> (topic|start):/.test(l)).map((l) => l.slice(2)).join("\n");
+  renderBlock("C.md", source, { text, lineStart: 0, lineEnd: lines.length - 1 });
+  assert.equal(rendered[0].result.ok, true, text);
+  assert.equal(plugin.active.length, 1);
+});
+
 (async () => {
   let failed = 0;
   for (const t of tests) {

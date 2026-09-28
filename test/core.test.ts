@@ -14,6 +14,7 @@ import {
   formatDuration,
   formatStamp,
   formatTimer,
+  isUnclosedAtEnd,
   parseBlock,
   parseStamp,
   planFinish,
@@ -597,12 +598,13 @@ test("planInsert: on a list item line the block is indented into the item", () =
   assert.equal(findBlocks(o2).length, 1);
 });
 
-test("applyInsert keeps CRLF text outside the insertion intact", () => {
+test("applyInsert on CRLF text keeps every line ending CRLF", () => {
   const text = "a\r\nb\r\nc";
   const out = applyInsert(text, planInsert(text, 1, BLOCK));
-  assert.ok(out.startsWith("a\r\nb"));
-  assert.ok(out.endsWith("\r\nc"));
+  assert.equal(out, "a\r\nb\r\n" + BLOCK.replace(/\n/g, "\r\n") + "\r\n\r\nc");
   assert.equal(findBlocks(out).length, 1);
+  const t2 = "abc\r\n\r\ndef";
+  assert.equal(applyInsert(t2, planInsert(t2, 1, BLOCK)), "abc\r\n" + BLOCK.replace(/\n/g, "\r\n") + "\r\n\r\ndef");
 });
 
 test("list marker followed by a tab is measured from the marker's column", () => {
@@ -613,6 +615,49 @@ test("list marker followed by a tab is measured from the marker's column", () =>
 test("a fence far below its list item (long item) is still found", () => {
   const text = "- item\n" + "  para\n".repeat(250) + "    ```timebox\n    start: 2026-09-28 10:00\n    ```";
   assert.equal(findBlocks(text).length, 1);
+});
+
+// ─────────────── regressions from review round 3 ───────────────
+
+test("isUnclosedAtEnd: valid blocks in a callout or list at the end of the note are not flagged", () => {
+  const callout = "# N\n> [!note]\n> ```timebox\n> start: 2026-09-28 10:00\n> ```\n> some text";
+  assert.equal(isUnclosedAtEnd(callout, 1, 5, "start: 2026-09-28 10:00"), false);
+  const list = "- a\n  ```timebox\n  start: 2026-09-28 10:00\n  ```\n- b";
+  assert.equal(isUnclosedAtEnd(list, 0, 4, "start: 2026-09-28 10:00"), false);
+  const closedAtEnd = "x\n```timebox\nstart: 2026-09-28 10:00\n```\n";
+  assert.equal(isUnclosedAtEnd(closedAtEnd, 1, 3, "start: 2026-09-28 10:00"), false);
+});
+
+test("isUnclosedAtEnd: fences never closed before the end of the note are flagged", () => {
+  const open = "intro\n```timebox\nstart: 2026-09-28 10:00\n";
+  assert.equal(isUnclosedAtEnd(open, 1, 3, "start: 2026-09-28 10:00\n"), true);
+  assert.equal(isUnclosedAtEnd(open, 1, 2, "start: 2026-09-28 10:00\n"), true, "section size doesn't matter");
+  const tilde = "```timebox\nstart: 2026-09-28 10:00\n~~~";
+  assert.equal(isUnclosedAtEnd(tilde, 0, 2, "start: 2026-09-28 10:00\n~~~"), true, "~~~ doesn't close ```");
+  const quoted = "> ```timebox\n> start: 2026-09-28 10:00";
+  assert.equal(isUnclosedAtEnd(quoted, 0, 1, "start: 2026-09-28 10:00"), true);
+  // two blocks in one callout: the right one is picked by its start
+  const two = "> ```timebox\n> start: 2026-09-28 09:00\n> ```\n> ```timebox\n> start: 2026-09-28 10:00";
+  assert.equal(isUnclosedAtEnd(two, 0, 4, "start: 2026-09-28 09:00"), false);
+  assert.equal(isUnclosedAtEnd(two, 0, 4, "start: 2026-09-28 10:00"), true);
+});
+
+test("planInsert: a code block closed by a shallower list item gets the item's indentation", () => {
+  const text = "- a\n  - b\n    ```js\n    code\n  - c";
+  const out = applyInsert(text, planInsert(text, 3, BLOCK));
+  assert.ok(out.startsWith("- a\n  - b\n    ```js\n    code\n  ```timebox\n"), out);
+  assert.ok(out.endsWith("\n  - c"));
+  assert.equal(findBlocks(out).length, 1);
+});
+
+test("planInsert: an indented blank line inside a list item stays in the item", () => {
+  const text = "- a\n  \n  more";
+  const out = applyInsert(text, planInsert(text, 1, BLOCK));
+  assert.equal(out, "- a\n  ```timebox\n  topic: T\n  start: 2026-09-28 10:00:00\n  ```\n\n  more");
+  assert.equal(findBlocks(out).length, 1);
+  // a truly empty line after a list stays top-level
+  const t2 = "- a\n\nb";
+  assert.ok(applyInsert(t2, planInsert(t2, 1, BLOCK)).startsWith("- a\n```timebox\n"));
 });
 
 // ─────────────── robustness ───────────────
@@ -677,6 +722,12 @@ test("performance: many indented fences and long list items (list lookback)", ()
     findBlocks(listy.join("\n"));
     planInsert(listy.join("\n"), 10_000, BLOCK);
   });
+  assert.ok(ms < 1000, `took ${ms}ms`);
+});
+
+test("performance: list lookups stay linear (50k indented fences under list-less text)", () => {
+  const text = "  x\n    ```\n".repeat(50_000);
+  const ms = timed(() => findBlocks(text));
   assert.ok(ms < 1000, `took ${ms}ms`);
 });
 
