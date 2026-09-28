@@ -660,6 +660,35 @@ test("planInsert: an indented blank line inside a list item stays in the item", 
   assert.ok(applyInsert(t2, planInsert(t2, 1, BLOCK)).startsWith("- a\n```timebox\n"));
 });
 
+// ─────────────── regressions from review round 4 ───────────────
+
+test("isUnclosedAtEnd: a block whose start doesn't match anything in the section isn't flagged", () => {
+  assert.equal(isUnclosedAtEnd("![[Other]]\n```timebox\nstart: 2026-09-28 08:00", 0, 2, "start: 2026-09-28 10:00"), false);
+  assert.equal(isUnclosedAtEnd("```timebox\nstart: 2026-09-28 08:00", 0, 1, "not a block"), false);
+});
+
+test("performance: rendering every block of a 2000-block note checks unclosed fences quickly", () => {
+  const parts: string[] = [];
+  for (let i = 0; i < 2000; i++) {
+    const t = new Date(2026, 0, 1, 0, 0, i);
+    parts.push("```timebox", `start: ${formatStamp(t)}`, "```", "");
+  }
+  const text = parts.join("\n");
+  const ms = timed(() => {
+    for (let i = 0; i < 2000; i++) {
+      isUnclosedAtEnd(text, i * 4, i * 4 + 2, `start: ${formatStamp(new Date(2026, 0, 1, 0, 0, i))}`);
+    }
+  });
+  assert.ok(ms < 1000, `took ${ms}ms`);
+});
+
+test("performance: thousands of distinct indentation widths", () => {
+  const lines: string[] = [];
+  for (let i = 0; i < 10_000; i++) lines.push(" ".repeat(1 + (i % 1000)) + "x", " ".repeat(5 + (i % 1000)) + "```");
+  const ms = timed(() => findBlocks(lines.join("\n")));
+  assert.ok(ms < 1000, `took ${ms}ms`);
+});
+
 // ─────────────── robustness ───────────────
 
 /** Runs fn and returns the elapsed milliseconds. */

@@ -402,19 +402,25 @@ function lineInfoCache(lines: string[]): (depth: number, k: number) => LineInfo 
   const byDepth = new Map<number, LineInfo[]>();
   return (depth, k) => {
     let arr = byDepth.get(depth);
-    if (!arr) byDepth.set(depth, (arr = []));
+    // preallocated: filling a plain [] from the bottom up would make it a slow sparse array
+    if (!arr) byDepth.set(depth, (arr = new Array<LineInfo>(lines.length)));
     let info = arr[k];
     if (!info) {
       const inner = stripQuotes(lines[k], depth);
-      info =
-        inner === null
-          ? { outside: true, blank: false, listCol: -1, lead: 0 }
-          : {
-              outside: false,
-              blank: inner.trim() === "",
-              listCol: listContentColumn(inner),
-              lead: indentWidth(inner.match(/^[ \t]*/)![0]),
-            };
+      if (inner === null) {
+        info = { outside: true, blank: false, listCol: -1, lead: 0 };
+      } else {
+        // one pass over the leading whitespace; the list regex only runs if a marker follows
+        let lead = 0;
+        let i = 0;
+        for (; i < inner.length && (inner[i] === " " || inner[i] === "\t"); i++) {
+          lead += inner[i] === "\t" ? 4 - (lead % 4) : 1;
+        }
+        const c = inner[i];
+        const blank = i === inner.length || (c === "\r" && i === inner.length - 1);
+        const maybeList = c === "-" || c === "*" || c === "+" || (c >= "0" && c <= "9");
+        info = { outside: false, blank, listCol: maybeList ? listContentColumn(inner) : -1, lead };
+      }
       arr[k] = info;
     }
     return info;
@@ -424,21 +430,31 @@ function lineInfoCache(lines: string[]): (depth: number, k: number) => LineInfo 
 type ListOwnerFinder = (depth: number, fromLine: number, indent: number) => number;
 
 /**
+ * Content deeper than this is never treated as part of a list item (that would take 30+ levels
+ * of nesting). Bounding it keeps the memoized lookups at O(lines × MAX_LIST_INDENT) even for
+ * notes with thousands of different indentation widths.
+ */
+const MAX_LIST_INDENT = 120;
+
+/**
  * Returns a function that, for content indented by `indent` columns at quote depth `depth`,
  * walks up from `fromLine` to find the content column of the list item it belongs to (-1 if
  * none). Results are memoized per (depth, indent, line), so all lookups in a note together
  * take time linear in its length.
  */
-function listOwnerFinder(info: (depth: number, k: number) => LineInfo): ListOwnerFinder {
-  const memo = new Map<string, number[]>();
+const UNKNOWN = -2;
+
+function listOwnerFinder(info: (depth: number, k: number) => LineInfo, lineCount: number): ListOwnerFinder {
+  const memo = new Map<string, Int32Array>();
   return (depth, fromLine, indent) => {
+    if (indent > MAX_LIST_INDENT) return -1;
     const key = depth + ":" + indent;
     let known = memo.get(key);
-    if (!known) memo.set(key, (known = []));
+    if (!known) memo.set(key, (known = new Int32Array(lineCount).fill(UNKNOWN)));
     const visited: number[] = [];
     let result = -1;
     for (let k = fromLine; k >= 0; k--) {
-      if (known[k] !== undefined) {
+      if (known[k] !== UNKNOWN) {
         result = known[k];
         break;
       }
@@ -471,7 +487,7 @@ function listOwnerFinder(info: (depth: number, k: number) => LineInfo): ListOwne
  */
 function scanFences(lines: string[]): Fence[] {
   const out: Fence[] = [];
-  const listOwner = listOwnerFinder(lineInfoCache(lines));
+  const listOwner = listOwnerFinder(lineInfoCache(lines), lines.length);
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(RE_FENCE_OPEN);
     if (!m) continue;
@@ -670,7 +686,7 @@ export function planInsert(text: string, cursorLine: number, block: string): Ins
       // an indented blank line inside a list item: stay in that item
       const w = indentWidth(inner);
       const depth = (quote.match(/>/g) ?? []).length;
-      if (w > 0) col = listOwnerFinder(lineInfoCache(lines))(depth, anchor - 1, w);
+      if (w > 0) col = listOwnerFinder(lineInfoCache(lines), lines.length)(depth, anchor - 1, w);
     }
     prefix = quote + (col > 0 ? " ".repeat(col) : "");
   }
@@ -728,18 +744,31 @@ export function applyInsert(text: string, plan: InsertPlan): string {
  * callout or list the section is the whole container). Returns false if it can't be identified.
  */
 export function isUnclosedAtEnd(docText: string, lineStart: number, lineEnd: number, source: string, dayOf?: Date): boolean {
-  const { lines } = splitLines(docText);
-  const inSection = scanFences(lines).filter(
-    (f) => f.lang === BLOCK_LANG && f.openLine >= lineStart && f.openLine <= lineEnd
-  );
   const want = parseBlock(source, dayOf);
-  const key = want.ok ? formatStamp(want.session.start) : null;
-  const match =
-    inSection.find((f) => {
-      const p = parseBlock(f.body.join("\n"), dayOf);
-      return key !== null && p.ok && formatStamp(p.session.start) === key;
-    }) ?? (inSection.length === 1 ? inSection[0] : undefined);
-  return !!match && !match.closed && match.closeLine >= lines.length;
+  if (!want.ok) return false;
+  const key = formatStamp(want.session.start);
+  const { lineCount, fences } = fencesOf(docText);
+  const match = fences.find((f) => {
+    if (f.lang !== BLOCK_LANG || f.openLine < lineStart || f.openLine > lineEnd) return false;
+    const p = parseBlock(f.body.join("\n"), dayOf);
+    return p.ok && formatStamp(p.session.start) === key;
+  });
+  // No match means the section isn't this block's file (e.g. an embed): don't guess.
+  return !!match && !match.closed && match.closeLine >= lineCount;
+}
+
+/**
+ * Single-entry cache of the last scanned note. Rendering a note calls isUnclosedAtEnd once per
+ * block with the same text, so without it a note with many blocks is rescanned for every block.
+ */
+let lastScan: { text: string; lineCount: number; fences: Fence[] } | null = null;
+
+function fencesOf(text: string): { lineCount: number; fences: Fence[] } {
+  if (lastScan === null || lastScan.text !== text) {
+    const { lines } = splitLines(text);
+    lastScan = { text, lineCount: lines.length, fences: scanFences(lines) };
+  }
+  return lastScan;
 }
 
 /**
