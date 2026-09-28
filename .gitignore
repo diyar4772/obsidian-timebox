@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# build output (main.js is published as a release asset, not committed)
+main.js
+*.js.map
+.test-out/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+.directory
+*.log
+
+# archives
+*.zip
