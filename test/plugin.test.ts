@@ -42,13 +42,18 @@ async function setup(files: Record<string, string>, open: string[] = [], mode: "
   };
   const plugin: any = new (TimeboxPlugin as any)(app);
   await plugin.onload();
-  const renderBlock = (path: string, source: string) =>
-    plugin.processors.get("timebox")(source, {}, { sourcePath: path, addChild() {} });
+  const rendered: any[] = [];
+  const renderBlock = (path: string, source: string, section?: { text: string; lineStart: number; lineEnd: number }) =>
+    plugin.processors.get("timebox")(source, {}, {
+      sourcePath: path,
+      addChild: (c: any) => rendered.push(c),
+      ...(section ? { getSectionInfo: () => section } : {}),
+    });
   const text = (p: string) => {
     const v = views.find((x) => x.file.path === p);
     return v && v.getMode() === "source" ? v.editor.getValue() : disk[p];
   };
-  return { plugin, app, disk, tfiles, views, handlers, renderBlock, text };
+  return { plugin, app, disk, tfiles, views, handlers, renderBlock, rendered, text };
 }
 
 const tests: { name: string; fn: () => Promise<void> }[] = [];
@@ -305,6 +310,33 @@ test("no session starts if the note was deleted while the dialog was open", asyn
   assert.equal(views[0].editor.getValue(), "x");
   assert.equal(plugin.active.length, 0);
   assert.equal(Notice.log.length, 1);
+});
+
+test("a block never closed before the end of the note renders an error and isn't tracked", async () => {
+  const { plugin, renderBlock, rendered } = await setup({ "U.md": "" });
+  const text = "intro\n```timebox\nstart: 2026-09-28 10:00\n";
+  renderBlock("U.md", "start: 2026-09-28 10:00\n", { text, lineStart: 1, lineEnd: 3 });
+  assert.equal(rendered[0].result.ok, false);
+  assert.match(rendered[0].result.error, /no closing fence/);
+  assert.equal(plugin.active.length, 0);
+  // a closed block at the very end is fine
+  const closed = "```timebox\nstart: 2026-09-28 10:00\n```";
+  renderBlock("U.md", "start: 2026-09-28 10:00", { text: closed, lineStart: 0, lineEnd: 2 });
+  assert.equal(rendered[1].result.ok, true);
+  assert.equal(plugin.active.length, 1);
+});
+
+test("starting inside a code block closed by its callout puts the session outside it and finishes the previous one", async () => {
+  modalAnswer = "T";
+  const { plugin, views } = await setup({ "Q.md": "> ```js\n> code\ntext\n```timebox\nstart: 2026-09-28 09:00:00\n```" }, ["Q.md"]);
+  plugin.active.push({ path: "Q.md", start: "2026-09-28 09:00:00", topic: "", mode: "simple" });
+  views[0].editor.cursor = { line: 1, ch: 2 };
+  await plugin.startFromEditor(views[0].editor, views[0], "simple");
+  const txt = views[0].editor.getValue();
+  assert.match(txt, /^> ```js\n> code\n```timebox\ntopic: T\nstart: .+\n```\n\ntext\n/);
+  assert.match(txt, /start: 2026-09-28 09:00:00\nend: /, "the previous session is finished");
+  assert.equal(plugin.active.length, 1);
+  assert.equal(plugin.active[0].topic, "T");
 });
 
 (async () => {

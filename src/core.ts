@@ -337,8 +337,11 @@ interface Fence {
 const RE_FENCE_OPEN = /^((?:[ \t]*>)*)([ \t]*)(`{3,}|~{3,})(.*)$/;
 const RE_QUOTE_MARKER = /^[ \t]*>/;
 const RE_LIST_ITEM = /^([ \t]*)([-*+]|\d{1,9}[.)])([ \t]+|$)/;
-/** How far up to look for the list item that owns an indented fence. */
-const LIST_LOOKBACK = 200;
+/**
+ * How far up to look for the list item that owns an indented fence. Bounded so pathological
+ * notes stay fast; a fence more than this many lines below its list item is treated as top-level.
+ */
+const LIST_LOOKBACK = 1000;
 
 /** Splits on LF, remembering which lines ended with CR so mixed line endings survive edits. */
 function splitLines(text: string): { lines: string[]; cr: boolean[] } {
@@ -348,10 +351,20 @@ function splitLines(text: string): { lines: string[]; cr: boolean[] } {
 }
 
 /** Visual width of leading whitespace (a tab counts as 4 columns). */
-function indentWidth(ws: string): number {
-  let w = 0;
+/** Visual width of whitespace starting at column `startCol` (tabs advance to the next multiple of 4). */
+function indentWidth(ws: string, startCol = 0): number {
+  let w = startCol;
   for (const c of ws) w += c === "\t" ? 4 - (w % 4) : 1;
-  return w;
+  return w - startCol;
+}
+
+/** Content column of a list item line (CommonMark: 1–4 columns after the marker, else 1), or -1. */
+function listContentColumn(line: string): number {
+  const m = line.match(RE_LIST_ITEM);
+  if (!m) return -1;
+  const markerEnd = indentWidth(m[1]) + m[2].length;
+  const gap = indentWidth(m[3], markerEnd);
+  return markerEnd + (gap === 0 || gap > 4 ? 1 : gap);
 }
 
 /** Removes `depth` blockquote markers. Returns null if the line has fewer markers (the quote ended). */
@@ -378,23 +391,60 @@ function stripIndent(line: string, cols: number): string {
   return line.slice(i);
 }
 
+/** What the list lookup needs to know about one line at a given quote depth. */
+interface LineInfo {
+  /** The line has fewer quote markers than the depth (the quote ended). */
+  outside: boolean;
+  blank: boolean;
+  /** Content column if the line is a list item, else -1. */
+  listCol: number;
+  /** Indentation of the line's content. */
+  lead: number;
+}
+
+/** Lazily computes and caches LineInfo per (depth, line), so repeated lookups stay cheap. */
+function lineInfoCache(lines: string[]): (depth: number, k: number) => LineInfo {
+  const byDepth = new Map<number, LineInfo[]>();
+  return (depth, k) => {
+    let arr = byDepth.get(depth);
+    if (!arr) byDepth.set(depth, (arr = []));
+    let info = arr[k];
+    if (!info) {
+      const inner = stripQuotes(lines[k], depth);
+      info =
+        inner === null
+          ? { outside: true, blank: false, listCol: -1, lead: 0 }
+          : {
+              outside: false,
+              blank: inner.trim() === "",
+              listCol: listContentColumn(inner),
+              lead: indentWidth(inner.match(/^[ \t]*/)![0]),
+            };
+      arr[k] = info;
+    }
+    return info;
+  };
+}
+
 /**
  * For a fence indented by `indent` columns, finds the content column of the list item it
  * belongs to (looking a limited number of lines up), or -1 if it isn't in a list.
  */
-function listContainerColumn(lines: string[], openLine: number, depth: number, indent: number): number {
+function listContainerColumn(
+  info: (depth: number, k: number) => LineInfo,
+  openLine: number,
+  depth: number,
+  indent: number
+): number {
   for (let k = openLine - 1; k >= 0 && k >= openLine - LIST_LOOKBACK; k--) {
-    const inner = stripQuotes(lines[k], depth);
-    if (inner === null) return -1;
-    if (inner.trim() === "") continue;
-    const m = inner.match(RE_LIST_ITEM);
-    if (m) {
-      const col = indentWidth(m[1]) + m[2].length + Math.max(1, indentWidth(m[3]));
-      if (col <= indent && indent - col <= 3) return col;
+    const l = info(depth, k);
+    if (l.outside) return -1;
+    if (l.blank) continue;
+    if (l.listCol >= 0) {
+      if (l.listCol <= indent && indent - l.listCol <= 3) return l.listCol;
       continue; // a deeper or shallower sibling item; keep looking for the owner
     }
-    const lead = indentWidth(inner.match(/^[ \t]*/)![0]);
-    if (lead === 0) return -1; // plain top-level text: not inside a list
+    if (l.lead === 0) return -1; // plain top-level text: not inside a list
   }
   return -1;
 }
@@ -410,6 +460,7 @@ function listContainerColumn(lines: string[], openLine: number, depth: number, i
  */
 function scanFences(lines: string[]): Fence[] {
   const out: Fence[] = [];
+  const lineInfo = lineInfoCache(lines);
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(RE_FENCE_OPEN);
     if (!m) continue;
@@ -424,7 +475,7 @@ function scanFences(lines: string[]): Fence[] {
     const indent = indentWidth(afterQuote);
     let container = 0;
     if (indent > 0) {
-      container = listContainerColumn(lines, i, depth, indent);
+      container = listContainerColumn(lineInfo, i, depth, indent);
       if (container < 0) {
         if (indent >= 4) continue; // indented code block, not a fence
         container = 0;
@@ -557,67 +608,92 @@ const RE_QUOTE_PREFIX = /^(?:[ \t]*>)+[ \t]?/;
  * Plans inserting `block` at the cursor line (pure; the caller applies it with one replaceRange):
  * - an empty line is replaced, otherwise the block goes on the line below;
  * - inside a blockquote/callout, the block gets the same ">" prefix so it stays inside;
- * - inside another code block, the block goes below that code block instead of into it;
+ * - on a list item line, the block is indented to the item's content so the list isn't split;
+ * - inside another code block, the block goes below that code block (outside the quote or list
+ *   item that implicitly closed it), or above it if the code block is never closed;
  * - an empty line is kept (or added) below the block for the cursor.
+ * Callers should still check the result with `applyInsert` + `findBlockByStart` before editing.
  */
 export function planInsert(text: string, cursorLine: number, block: string): InsertPlan {
   const { lines } = splitLines(text);
   let anchor = Math.min(Math.max(0, cursorLine), lines.length - 1);
   let inFence = false;
-  let quoteSource = lines[anchor];
+  let prefix: string | null = null;
 
   for (const f of scanFences(lines)) {
     const last = f.closed ? f.closeLine : f.closeLine - 1;
     if (anchor < f.openLine || anchor > last) continue;
     inFence = true;
-    quoteSource = lines[f.openLine];
-    if (f.closed || f.closeLine < lines.length) {
-      anchor = last; // below the code block
+    if (f.closed) {
+      anchor = f.closeLine; // below the closing fence, in the same container
+      prefix = quotePrefixOf(lines[f.openLine]);
+    } else if (f.closeLine < lines.length) {
+      // closed implicitly by the end of its quote or list item: go below it, in the
+      // container of the first line after it (never back inside the open code block)
+      anchor = f.closeLine - 1;
+      prefix = quotePrefixOf(lines[f.closeLine]);
     } else {
-      // an unclosed code block runs to the end: put the block above it
-      const prefix = (quoteSource.match(RE_QUOTE_PREFIX) ?? [""])[0];
-      const body = block.split("\n").map((l) => prefix + l);
-      const insert = body.join("\n") + "\n" + prefix.trimEnd() + "\n";
+      // never closed: it runs to the end of the note, so put the block above it
+      const p = quotePrefixOf(lines[f.openLine]);
+      const body = block.split("\n").map((l) => p + l);
       return {
         from: { line: f.openLine, ch: 0 },
         to: { line: f.openLine, ch: 0 },
-        text: insert,
-        cursor: { line: f.openLine + body.length, ch: prefix.trimEnd().length },
+        text: body.join("\n") + "\n" + p.trimEnd() + "\n",
+        cursor: { line: f.openLine + body.length, ch: p.trimEnd().length },
         openLine: f.openLine,
       };
     }
     break;
   }
 
-  const prefix = (quoteSource.match(RE_QUOTE_PREFIX) ?? [""])[0];
-  const blockLines = block.split("\n").map((l) => prefix + l);
   const current = lines[anchor];
-  const isEmpty = !inFence && current.slice((current.match(RE_QUOTE_PREFIX) ?? [""])[0].length).trim() === "";
+  if (prefix === null) {
+    const quote = quotePrefixOf(current);
+    const col = listContentColumn(current.slice(quote.length));
+    prefix = quote + (col > 0 ? " ".repeat(col) : "");
+  }
+  const blockLines = block.split("\n").map((l) => prefix + l);
+  const isEmpty = !inFence && current.slice(quotePrefixOf(current).length).trim() === "";
 
   const next = lines[anchor + 1];
-  const trailingLine = prefix.trimEnd() === "" ? "" : prefix;
-  const nextIsFree =
-    next !== undefined && (prefix === "" ? next.trim() === "" : next.trimEnd() === prefix.trimEnd());
+  const trailingLine = prefix.trim() === "" ? "" : prefix;
+  const nextIsFree = next !== undefined && next.trim() === prefix.trim();
   const trailing = nextIsFree ? "" : "\n" + trailingLine;
 
   const openLine = isEmpty ? anchor : anchor + 1;
   const closeLine = openLine + blockLines.length - 1;
-  const cursorCh = nextIsFree ? next.length : trailingLine.length;
+  const cursor = { line: closeLine + 1, ch: nextIsFree ? next.length : trailingLine.length };
   return isEmpty
     ? {
         from: { line: anchor, ch: 0 },
         to: { line: anchor, ch: current.length },
         text: blockLines.join("\n") + trailing,
-        cursor: { line: closeLine + 1, ch: cursorCh },
+        cursor,
         openLine,
       }
     : {
         from: { line: anchor, ch: current.length },
         to: { line: anchor, ch: current.length },
         text: "\n" + blockLines.join("\n") + trailing,
-        cursor: { line: closeLine + 1, ch: cursorCh },
+        cursor,
         openLine,
       };
+}
+
+function quotePrefixOf(line: string): string {
+  return (line.match(RE_QUOTE_PREFIX) ?? [""])[0];
+}
+
+/** Applies an insert plan to the text (to check the result before touching the editor). */
+export function applyInsert(text: string, plan: InsertPlan): string {
+  const raw = text.split("\n"); // keeps any CR, so offsets match the original text
+  const offset = (pos: { line: number; ch: number }) => {
+    let n = 0;
+    for (let i = 0; i < pos.line; i++) n += raw[i].length + 1;
+    return n + pos.ch;
+  };
+  return text.slice(0, offset(plan.from)) + plan.text + text.slice(offset(plan.to));
 }
 
 /**

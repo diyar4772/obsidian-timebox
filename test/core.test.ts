@@ -4,6 +4,7 @@
 import * as assert from "assert";
 import {
   applyEdit,
+  applyInsert,
   buildBlock,
   completedPomodoros,
   dayDiff,
@@ -566,6 +567,54 @@ test("planInsert: inside another code block the block goes below it", () => {
   assert.deepEqual(r2.plan.cursor, { line: 5, ch: 0 });
 });
 
+// ─────────────── regressions from review round 2 ───────────────
+
+test("planInsert: inside a code block closed implicitly by its quote, the block goes outside it", () => {
+  const text = "> ```js\n> code\ntext";
+  const out = applyInsert(text, planInsert(text, 1, BLOCK));
+  assert.equal(out, "> ```js\n> code\n" + BLOCK + "\n\ntext");
+  assert.equal(findBlocks(out).length, 1);
+  // nested quote closed by a depth-1 line: the block stays in the outer quote
+  const t2 = ">> ```js\n>> code\n> outer";
+  const o2 = applyInsert(t2, planInsert(t2, 1, BLOCK));
+  assert.equal(findBlocks(o2).length, 1, o2);
+  assert.ok(o2.startsWith(">> ```js\n>> code\n> ```timebox\n"), o2);
+  // a list item's code block closed by an unindented line
+  const t3 = "- item\n  ```js\n  code\nnext";
+  const o3 = applyInsert(t3, planInsert(t3, 2, BLOCK));
+  assert.equal(findBlocks(o3).length, 1, o3);
+  assert.ok(o3.endsWith("\nnext"));
+});
+
+test("planInsert: on a list item line the block is indented into the item", () => {
+  const text = "- one\n- two";
+  const out = applyInsert(text, planInsert(text, 0, BLOCK));
+  assert.equal(out, "- one\n  ```timebox\n  topic: T\n  start: 2026-09-28 10:00:00\n  ```\n\n- two");
+  assert.equal(findBlocks(out).length, 1);
+  const t2 = "> 1. step";
+  const o2 = applyInsert(t2, planInsert(t2, 0, BLOCK));
+  assert.ok(o2.startsWith("> 1. step\n>    ```timebox\n"), o2);
+  assert.equal(findBlocks(o2).length, 1);
+});
+
+test("applyInsert keeps CRLF text outside the insertion intact", () => {
+  const text = "a\r\nb\r\nc";
+  const out = applyInsert(text, planInsert(text, 1, BLOCK));
+  assert.ok(out.startsWith("a\r\nb"));
+  assert.ok(out.endsWith("\r\nc"));
+  assert.equal(findBlocks(out).length, 1);
+});
+
+test("list marker followed by a tab is measured from the marker's column", () => {
+  assert.equal(findBlocks("-\titem\n\t```timebox\n\tstart: 2026-09-28 10:00\n\t```").length, 1);
+  assert.equal(findBlocks("- item\n\t```timebox\n\tstart: 2026-09-28 10:00\n\t```").length, 1);
+});
+
+test("a fence far below its list item (long item) is still found", () => {
+  const text = "- item\n" + "  para\n".repeat(250) + "    ```timebox\n    start: 2026-09-28 10:00\n    ```";
+  assert.equal(findBlocks(text).length, 1);
+});
+
 // ─────────────── robustness ───────────────
 
 /** Runs fn and returns the elapsed milliseconds. */
@@ -615,6 +664,19 @@ test("performance: a large note with many blocks", () => {
     planFinish(text, d(2026, 9, 28, 23, 59, 59), d(2026, 9, 29));
   });
   assert.equal(found, 2000);
+  assert.ok(ms < 1000, `took ${ms}ms`);
+});
+
+test("performance: many indented fences and long list items (list lookback)", () => {
+  const parts: string[] = [];
+  for (let i = 0; i < 5000; i++) parts.push("    ```x", "    code", "    ```");
+  const listy: string[] = [];
+  for (let i = 0; i < 2000; i++) listy.push("- item " + i, ..."  continued\n".repeat(20).trim().split("\n"), "    ```timebox", "    start: 2026-09-28 10:00", "    ```");
+  const ms = timed(() => {
+    findBlocks(parts.join("\n"));
+    findBlocks(listy.join("\n"));
+    planInsert(listy.join("\n"), 10_000, BLOCK);
+  });
   assert.ok(ms < 1000, `took ${ms}ms`);
 });
 

@@ -3,9 +3,11 @@ import {
   BLOCK_LANG,
   PHASE_EMOJI,
   PHASE_LABEL,
+  ParseResult,
   Session,
   SessionMode,
   applyEdit,
+  applyInsert,
   buildBlock,
   findBlockByStart,
   findBlocks,
@@ -60,7 +62,12 @@ export default class TimeboxPlugin extends Plugin {
 
     this.registerMarkdownCodeBlockProcessor(BLOCK_LANG, (source, el, ctx) => {
       const dayOf = this.fileDay(ctx.sourcePath);
-      const result = parseBlock(source, dayOf);
+      let result: ParseResult = parseBlock(source, dayOf);
+      // A fence that is never closed runs to the end of the note: it renders, but can't be finished.
+      const info = typeof ctx.getSectionInfo === "function" ? ctx.getSectionInfo(el) : null;
+      if (result.ok && info && runsToEndUnclosed(info.text, info.lineStart, info.lineEnd)) {
+        result = { ok: false, error: "This block has no closing fence. Add a line with ``` below it." };
+      }
       // Blocks from non-markdown sources (e.g. Canvas cards) can't be located in a file; don't track them.
       if (result.ok && !result.session.end && ctx.sourcePath.endsWith(".md")) {
         this.observeActive(ctx.sourcePath, result.session);
@@ -228,12 +235,22 @@ export default class TimeboxPlugin extends Plugin {
     for (const a of this.active) taken.add(a.start);
     while (taken.has(formatStamp(now))) now.setSeconds(now.getSeconds() + 1);
 
+    const session: Session = { topic, start: now, end: null, mode, extra: [] };
+    const block = buildBlock(session);
+    // Dry run first: if the block can't be placed cleanly here, change nothing (not even
+    // the previous sessions).
+    const before = editor.getValue();
+    const preview = applyInsert(before, planInsert(before, editor.getCursor("to").line, block));
+    if (!findBlockByStart(preview, now, this.fileDay(file.path))) {
+      new Notice("A session can't be placed on this line. Click an empty line and try again.");
+      return;
+    }
+
     if (this.settings.autoStopPrevious) {
       for (const entry of [...this.active]) await this.stopSession(entry, now);
     }
 
-    const session: Session = { topic, start: now, end: null, mode, extra: [] };
-    this.insertBlock(editor, buildBlock(session));
+    this.insertBlock(editor, block);
     // Safety net: only track the session if the inserted block can actually be found again.
     if (!findBlockByStart(editor.getValue(), now, this.fileDay(file.path))) {
       new Notice("The session block couldn't be placed here. Try an empty line outside other blocks.");
@@ -453,6 +470,14 @@ export default class TimeboxPlugin extends Plugin {
       await this.app.workspace.getLeaf(false).openFile(file);
     }
   }
+}
+
+/** Whether a code block section is an opening fence that is never closed before the end of the note. */
+function runsToEndUnclosed(text: string, lineStart: number, lineEnd: number): boolean {
+  const lines = text.split("\n");
+  if (lineEnd < lines.length - 1) return false; // the section ends before the last line
+  if (lineEnd <= lineStart) return true;
+  return !/^(?:[ \t]*>)*[ \t]*(`{3,}|~{3,})[ \t]*\r?$/.test(lines[lineEnd]);
 }
 
 function isActiveEntry(x: unknown): x is ActiveEntry {
