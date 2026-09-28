@@ -1,7 +1,7 @@
 {
 	"id": "timebox",
 	"name": "Timebox",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"minAppVersion": "1.4.0",
 	"description": "Track study and work sessions inside your notes: start and end times, total duration and an optional pomodoro cycle.",
 	"author": "Samed Yolcu",

@@ -1,6 +1,6 @@
 {
   "name": "timebox",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Obsidian plugin that tracks study and work sessions inside your notes, with an optional pomodoro cycle.",
   "main": "main.js",
   "private": true,
