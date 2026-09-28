@@ -52,7 +52,7 @@ const pad = (n: number) => String(n).padStart(2, "0");
 /** "2026-09-28 18:29:05": the canonical format stored in blocks, also the key used to find a block. */
 export function formatStamp(d: Date): string {
   return (
-    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${String(d.getFullYear()).padStart(4, "0")}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
     `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
   );
 }
@@ -97,7 +97,8 @@ const RE_TIME = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/;
 
 function makeDate(y: number, mo: number, d: number, h: number, mi: number, s: number): Date | null {
   if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 59) return null;
-  const date = new Date(y, mo - 1, d, h, mi, s);
+  const date = new Date(2000, 0, 1, h, mi, s);
+  date.setFullYear(y, mo - 1, d); // new Date(y, …) would map years 0–99 to 1900–1999
   // Reject overflowing dates such as 31.02
   if (date.getMonth() !== mo - 1 || date.getDate() !== d) return null;
   return date;
@@ -199,8 +200,13 @@ export function parseBlock(source: string, dayOf?: Date): ParseResult {
     if (!end) return { ok: false, error: `Can't read the end time “${endRaw}”. ${FORMAT_HINT}` };
     if (end < start) {
       // A bare time earlier than the start means midnight was crossed: move it to the next day.
-      if (isTimeOnly(endRaw)) end = new Date(end.getTime() + DAY);
-      else return { ok: false, error: "The end time can't be before the start time." };
+      // Re-read the time on the next calendar day (adding 24 h would be off by an hour on DST nights).
+      if (isTimeOnly(endRaw)) {
+        const nextDay = new Date(start.getTime());
+        nextDay.setDate(nextDay.getDate() + 1);
+        end = parseStamp(endRaw, nextDay);
+      }
+      if (!end || end < start) return { ok: false, error: "The end time can't be before the start time." };
     }
   }
 
@@ -299,85 +305,202 @@ export function rewriteBody(bodyLines: string[], s: Session): string[] {
 export interface FoundBlock {
   /** Line number of the opening fence (0-based). */
   openLine: number;
-  /** Line number of the closing fence. */
+  /**
+   * First line after the body: the closing fence, or, when the block is closed implicitly
+   * because its blockquote or list item ended, the first line outside that container.
+   */
   closeLine: number;
-  /** Indentation/blockquote prefix before the fence (e.g. "> " or "  "). Body lines carry it too. */
+  /** Whether the block ends with an explicit closing fence. */
+  closed: boolean;
+  /** The opening fence's quote/indent prefix (e.g. "> " or "  "). Written in front of new body lines. */
   prefix: string;
-  /** Body lines with the prefix removed. */
+  /** Body lines with the container prefix removed. */
   body: string[];
   session: Session;
 }
 
-// Fence: optional indentation and ">" quote markers, then 3+ ` or ~, then the info string.
-// Each repetition of the prefix group must end in ">", so matching stays linear in the
-// line length (a form like `[ \t]*(?:>[ \t]?)*[ \t]*` backtracks quadratically on long
-// whitespace-only lines and could freeze the editor).
-const RE_FENCE_OPEN = /^((?:[ \t]*>)*[ \t]*)(`{3,}|~{3,})(.*)$/;
-const RE_PREFIX_CHARS = /^(?:[ \t]*>)*[ \t]*/;
-
-function splitLines(text: string): { lines: string[]; eol: string } {
-  const eol = text.includes("\r\n") ? "\r\n" : "\n";
-  return { lines: text.split(eol), eol };
+/** Any fenced code block, whatever its language. */
+interface Fence {
+  openLine: number;
+  /** See FoundBlock.closeLine. For an unclosed top-level fence this is the line count. */
+  closeLine: number;
+  closed: boolean;
+  lang: string;
+  prefix: string;
+  body: string[];
 }
 
-function stripPrefix(line: string, prefix: string): string {
-  if (prefix === "") return line;
-  if (line.startsWith(prefix)) return line.slice(prefix.length);
-  // in a "> " block an empty line may be just ">"
-  if (line.trimEnd() === prefix.trimEnd()) return "";
-  // partially missing indentation: drop leading whitespace and quote markers
-  return line.replace(RE_PREFIX_CHARS, "");
+// Opening fence: blockquote markers, indentation, 3+ ` or ~, then the info string.
+// Each repetition of the quote group must end in ">", so matching stays linear in the
+// line length (a form like `[ \t]*(?:>[ \t]?)*[ \t]*` backtracks quadratically on long
+// whitespace-only lines and could freeze the editor).
+const RE_FENCE_OPEN = /^((?:[ \t]*>)*)([ \t]*)(`{3,}|~{3,})(.*)$/;
+const RE_QUOTE_MARKER = /^[ \t]*>/;
+const RE_LIST_ITEM = /^([ \t]*)([-*+]|\d{1,9}[.)])([ \t]+|$)/;
+/** How far up to look for the list item that owns an indented fence. */
+const LIST_LOOKBACK = 200;
+
+/** Splits on LF, remembering which lines ended with CR so mixed line endings survive edits. */
+function splitLines(text: string): { lines: string[]; cr: boolean[] } {
+  const lines = text.split("\n");
+  const cr = lines.map((l) => l.endsWith("\r"));
+  return { lines: lines.map((l, i) => (cr[i] ? l.slice(0, -1) : l)), cr };
+}
+
+/** Visual width of leading whitespace (a tab counts as 4 columns). */
+function indentWidth(ws: string): number {
+  let w = 0;
+  for (const c of ws) w += c === "\t" ? 4 - (w % 4) : 1;
+  return w;
+}
+
+/** Removes `depth` blockquote markers. Returns null if the line has fewer markers (the quote ended). */
+function stripQuotes(line: string, depth: number): string | null {
+  let rest = line;
+  for (let k = 0; k < depth; k++) {
+    const m = rest.match(RE_QUOTE_MARKER);
+    if (!m) return null;
+    rest = rest.slice(m[0].length);
+  }
+  // one optional space after the last marker belongs to the marker
+  if (depth > 0 && (rest[0] === " " || rest[0] === "\t")) rest = rest.slice(1);
+  return rest;
+}
+
+/** Removes up to `cols` columns of leading whitespace. */
+function stripIndent(line: string, cols: number): string {
+  let w = 0;
+  let i = 0;
+  while (i < line.length && w < cols && (line[i] === " " || line[i] === "\t")) {
+    w += line[i] === "\t" ? 4 - (w % 4) : 1;
+    i++;
+  }
+  return line.slice(i);
+}
+
+/**
+ * For a fence indented by `indent` columns, finds the content column of the list item it
+ * belongs to (looking a limited number of lines up), or -1 if it isn't in a list.
+ */
+function listContainerColumn(lines: string[], openLine: number, depth: number, indent: number): number {
+  for (let k = openLine - 1; k >= 0 && k >= openLine - LIST_LOOKBACK; k--) {
+    const inner = stripQuotes(lines[k], depth);
+    if (inner === null) return -1;
+    if (inner.trim() === "") continue;
+    const m = inner.match(RE_LIST_ITEM);
+    if (m) {
+      const col = indentWidth(m[1]) + m[2].length + Math.max(1, indentWidth(m[3]));
+      if (col <= indent && indent - col <= 3) return col;
+      continue; // a deeper or shallower sibling item; keep looking for the owner
+    }
+    const lead = indentWidth(inner.match(/^[ \t]*/)![0]);
+    if (lead === 0) return -1; // plain top-level text: not inside a list
+  }
+  return -1;
+}
+
+/**
+ * Scans the text for fenced code blocks of every language, following CommonMark:
+ * - a closing fence uses the same character, is at least as long as the opening one,
+ *   is indented at most 3 columns (relative to its container) and has nothing after it;
+ * - a fence inside a blockquote ends when the blockquote ends (a line without enough ">");
+ * - a fence inside a list item ends when a non-blank line is indented less than the item's content;
+ * - a line indented 4+ columns outside a list is an indented code block, not a fence;
+ * - an unclosed top-level fence runs to the end of the document.
+ */
+function scanFences(lines: string[]): Fence[] {
+  const out: Fence[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(RE_FENCE_OPEN);
+    if (!m) continue;
+    const [, quote, ws, fence, info] = m;
+    const ch = fence[0];
+    // CommonMark: a backtick fence's info string can't contain backticks (that's inline code).
+    if (ch === "`" && info.includes("`")) continue;
+
+    const depth = (quote.match(/>/g) ?? []).length;
+    // indentation after the quote marker's optional space
+    const afterQuote = depth > 0 && (ws[0] === " " || ws[0] === "\t") ? ws.slice(1) : ws;
+    const indent = indentWidth(afterQuote);
+    let container = 0;
+    if (indent > 0) {
+      container = listContainerColumn(lines, i, depth, indent);
+      if (container < 0) {
+        if (indent >= 4) continue; // indented code block, not a fence
+        container = 0;
+      }
+    }
+
+    const body: string[] = [];
+    let j = i + 1;
+    let closed = false;
+    for (; j < lines.length; j++) {
+      const inner = stripQuotes(lines[j], depth);
+      if (inner === null) break; // the blockquote ended
+      if (container > 0 && inner.trim() !== "" && indentWidth(inner.match(/^[ \t]*/)![0]) < container) break; // the list item ended
+      const rel = stripIndent(inner, container);
+      const lead = indentWidth(rel.match(/^[ \t]*/)![0]);
+      const t = rel.trim();
+      if (lead <= 3 && t.length >= fence.length && t === ch.repeat(t.length)) {
+        closed = true;
+        break;
+      }
+      body.push(stripIndent(inner, indent));
+    }
+
+    const lang = info.trim().split(/\s+/)[0].toLowerCase();
+    out.push({ openLine: i, closeLine: j, closed, lang, prefix: quote + ws, body });
+    if (!closed && depth === 0 && container === 0) break; // runs to the end of the document
+    i = closed ? j : j - 1;
+  }
+  return out;
 }
 
 /**
  * Finds every valid `timebox` block in the text.
  * Code blocks in other languages are skipped as well, so an example `timebox`
  * block inside a ```markdown block is not mistaken for a real one.
- * Unclosed blocks are ignored.
+ * An unclosed top-level block is ignored; a block closed implicitly by the end of its
+ * blockquote or list item counts, and only its own lines belong to it.
  */
 export function findBlocks(text: string, dayOf?: Date): FoundBlock[] {
   const { lines } = splitLines(text);
   const out: FoundBlock[] = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(RE_FENCE_OPEN);
-    if (!m) continue;
-    const [, prefix, fence, info] = m;
-    const ch = fence[0];
-    // CommonMark: a backtick fence's info string can't contain backticks (that's inline code).
-    if (ch === "`" && info.includes("`")) continue;
-
-    let j = i + 1;
-    for (; j < lines.length; j++) {
-      const t = stripPrefix(lines[j], prefix).trim();
-      if (t.length >= fence.length && t === ch.repeat(t.length)) break;
+  for (const f of scanFences(lines)) {
+    if (f.lang !== BLOCK_LANG) continue;
+    if (!f.closed && f.closeLine >= lines.length) continue; // never closed before the end of the note
+    const parsed = parseBlock(f.body.join("\n"), dayOf);
+    if (parsed.ok) {
+      out.push({ openLine: f.openLine, closeLine: f.closeLine, closed: f.closed, prefix: f.prefix, body: f.body, session: parsed.session });
     }
-    if (j >= lines.length) break; // unclosed: it runs to the end of the document
-
-    const lang = info.trim().split(/\s+/)[0].toLowerCase();
-    if (lang === BLOCK_LANG) {
-      const body = lines.slice(i + 1, j).map((l) => stripPrefix(l, prefix));
-      const parsed = parseBlock(body.join("\n"), dayOf);
-      if (parsed.ok) out.push({ openLine: i, closeLine: j, prefix, body, session: parsed.session });
-    }
-    i = j;
   }
   return out;
 }
 
-/** Finds the first block whose start time matches. */
+/**
+ * Finds the block whose start time matches. If several match (e.g. a copied block),
+ * a running one is preferred over a finished one.
+ */
 export function findBlockByStart(text: string, start: Date, dayOf?: Date): FoundBlock | null {
   const key = formatStamp(start);
-  return findBlocks(text, dayOf).find((b) => formatStamp(b.session.start) === key) ?? null;
+  const matches = findBlocks(text, dayOf).filter((b) => formatStamp(b.session.start) === key);
+  return matches.find((b) => !b.session.end) ?? matches[0] ?? null;
 }
 
 export interface BlockEdit {
   /** First body line to replace (the line after the opening fence). */
   fromLine: number;
-  /** End of the replaced range (the closing fence line, exclusive). */
+  /** End of the replaced range (exclusive): the closing fence, or the first line after the body. */
   toLine: number;
   /** New body lines (prefix included). */
   lines: string[];
+  /** True when nothing needs to change (e.g. the session was already finished). */
+  unchanged?: boolean;
+}
+
+function editFor(b: FoundBlock, next: Session): BlockEdit {
+  const lines = rewriteBody(b.body, next).map((l) => (l === "" ? b.prefix.trimEnd() : b.prefix + l));
+  return { fromLine: b.openLine + 1, toLine: b.closeLine, lines };
 }
 
 /**
@@ -392,23 +515,109 @@ export function planReplace(
   dayOf?: Date
 ): BlockEdit | null {
   const b = findBlockByStart(text, start, dayOf);
-  if (!b) return null;
-  const lines = rewriteBody(b.body, update(b.session)).map((l) =>
-    l === "" ? b.prefix.trimEnd() : b.prefix + l
-  );
-  return { fromLine: b.openLine + 1, toLine: b.closeLine, lines };
+  return b ? editFor(b, update(b.session)) : null;
 }
 
-/** The edit that finishes the session at `end`. */
+/**
+ * The edit that finishes the session at `end`. If the matching block already has an end
+ * (for example the user typed one by hand), it is left alone and the edit is marked unchanged.
+ */
 export function planFinish(text: string, start: Date, end: Date, dayOf?: Date): BlockEdit | null {
-  return planReplace(text, start, (cur) => ({ ...cur, end }), dayOf);
+  const b = findBlockByStart(text, start, dayOf);
+  if (!b) return null;
+  if (b.session.end) return { fromLine: b.openLine + 1, toLine: b.closeLine, lines: [], unchanged: true };
+  return editFor(b, { ...b.session, end });
 }
 
-/** Applies an edit to the text. Line endings (LF/CRLF) are preserved. */
+/** Applies an edit to the text. Each untouched line keeps its own line ending (LF or CRLF). */
 export function applyEdit(text: string, edit: BlockEdit): string {
-  const { lines, eol } = splitLines(text);
+  if (edit.unchanged) return text;
+  const { lines, cr } = splitLines(text);
+  const useCr = cr[edit.fromLine - 1] ?? false; // new lines follow the opening fence's ending
   lines.splice(edit.fromLine, edit.toLine - edit.fromLine, ...edit.lines);
-  return lines.join(eol);
+  cr.splice(edit.fromLine, edit.toLine - edit.fromLine, ...edit.lines.map(() => useCr));
+  return lines.map((l, i) => (cr[i] ? l + "\r" : l)).join("\n");
+}
+
+// ───────────────────────── inserting a new block ─────────────────────────
+
+export interface InsertPlan {
+  from: { line: number; ch: number };
+  to: { line: number; ch: number };
+  text: string;
+  /** Where the cursor goes afterwards: an empty line below the block. */
+  cursor: { line: number; ch: number };
+  /** Line of the inserted opening fence. */
+  openLine: number;
+}
+
+const RE_QUOTE_PREFIX = /^(?:[ \t]*>)+[ \t]?/;
+
+/**
+ * Plans inserting `block` at the cursor line (pure; the caller applies it with one replaceRange):
+ * - an empty line is replaced, otherwise the block goes on the line below;
+ * - inside a blockquote/callout, the block gets the same ">" prefix so it stays inside;
+ * - inside another code block, the block goes below that code block instead of into it;
+ * - an empty line is kept (or added) below the block for the cursor.
+ */
+export function planInsert(text: string, cursorLine: number, block: string): InsertPlan {
+  const { lines } = splitLines(text);
+  let anchor = Math.min(Math.max(0, cursorLine), lines.length - 1);
+  let inFence = false;
+  let quoteSource = lines[anchor];
+
+  for (const f of scanFences(lines)) {
+    const last = f.closed ? f.closeLine : f.closeLine - 1;
+    if (anchor < f.openLine || anchor > last) continue;
+    inFence = true;
+    quoteSource = lines[f.openLine];
+    if (f.closed || f.closeLine < lines.length) {
+      anchor = last; // below the code block
+    } else {
+      // an unclosed code block runs to the end: put the block above it
+      const prefix = (quoteSource.match(RE_QUOTE_PREFIX) ?? [""])[0];
+      const body = block.split("\n").map((l) => prefix + l);
+      const insert = body.join("\n") + "\n" + prefix.trimEnd() + "\n";
+      return {
+        from: { line: f.openLine, ch: 0 },
+        to: { line: f.openLine, ch: 0 },
+        text: insert,
+        cursor: { line: f.openLine + body.length, ch: prefix.trimEnd().length },
+        openLine: f.openLine,
+      };
+    }
+    break;
+  }
+
+  const prefix = (quoteSource.match(RE_QUOTE_PREFIX) ?? [""])[0];
+  const blockLines = block.split("\n").map((l) => prefix + l);
+  const current = lines[anchor];
+  const isEmpty = !inFence && current.slice((current.match(RE_QUOTE_PREFIX) ?? [""])[0].length).trim() === "";
+
+  const next = lines[anchor + 1];
+  const trailingLine = prefix.trimEnd() === "" ? "" : prefix;
+  const nextIsFree =
+    next !== undefined && (prefix === "" ? next.trim() === "" : next.trimEnd() === prefix.trimEnd());
+  const trailing = nextIsFree ? "" : "\n" + trailingLine;
+
+  const openLine = isEmpty ? anchor : anchor + 1;
+  const closeLine = openLine + blockLines.length - 1;
+  const cursorCh = nextIsFree ? next.length : trailingLine.length;
+  return isEmpty
+    ? {
+        from: { line: anchor, ch: 0 },
+        to: { line: anchor, ch: current.length },
+        text: blockLines.join("\n") + trailing,
+        cursor: { line: closeLine + 1, ch: cursorCh },
+        openLine,
+      }
+    : {
+        from: { line: anchor, ch: current.length },
+        to: { line: anchor, ch: current.length },
+        text: "\n" + blockLines.join("\n") + trailing,
+        cursor: { line: closeLine + 1, ch: cursorCh },
+        openLine,
+      };
 }
 
 /**
@@ -446,7 +655,7 @@ export function pomodoroPhase(elapsedMs: number, cfg: PomodoroConfig): Phase {
   const pair = W + S; // focus + short break
   const cycleLen = n * W + (n - 1) * S + L; // n focus periods, n-1 short breaks, 1 long break
 
-  const t = Math.max(0, elapsedMs);
+  const t = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0;
   const k = Math.floor(t / cycleLen); // completed full cycles
   const r = t - k * cycleLen; // position within the current cycle
   const j = Math.min(Math.floor(r / pair), n - 1); // focus slot within the cycle (0..n-1)

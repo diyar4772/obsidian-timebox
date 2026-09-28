@@ -7,6 +7,7 @@ import {
   buildBlock,
   completedPomodoros,
   dayDiff,
+  findBlockByStart,
   findBlocks,
   formatClock,
   formatDuration,
@@ -15,6 +16,7 @@ import {
   parseBlock,
   parseStamp,
   planFinish,
+  planInsert,
   pomodoroPhase,
   replaceBlock,
   rewriteBody,
@@ -427,6 +429,143 @@ test("pomodoro: invalid settings fall back to safe defaults", () => {
   assert.equal(p.phaseLength, 5 * MIN);
 });
 
+// ─────────────── regressions from the external review ───────────────
+
+test("callout without a closing fence inside the quote: only quoted lines are touched", () => {
+  const text = "> [!note]\n> ```timebox\n> start: 2026-09-28 10:00\n\nMy paragraph\n```js\nlet x = 1\n```\nafter";
+  const b = findBlocks(text);
+  assert.equal(b.length, 1);
+  assert.equal(b[0].closed, false);
+  assert.equal(b[0].closeLine, 3, "the block ends where the quote ends");
+  const out = applyEdit(text, planFinish(text, d(2026, 9, 28, 10), d(2026, 9, 28, 11))!);
+  assert.equal(
+    out,
+    "> [!note]\n> ```timebox\n> start: 2026-09-28 10:00:00\n> end: 2026-09-28 11:00:00\n> duration: 1h\n" +
+      "\nMy paragraph\n```js\nlet x = 1\n```\nafter"
+  );
+});
+
+test("an unquoted fence after a quoted opening is not its closing fence", () => {
+  const text = "> ```timebox\n> start: 2026-09-28 10:00\n```\ntext\n```";
+  const b = findBlocks(text);
+  assert.equal(b.length, 1);
+  assert.equal(b[0].closed, false);
+  assert.deepEqual(b[0].body, ["start: 2026-09-28 10:00"]);
+});
+
+test("a list item's block ends when the list item ends", () => {
+  const text = "- item\n  ```timebox\n  start: 2026-09-28 10:00\n\n  note: kept\nParagraph\n```\nafter";
+  const b = findBlocks(text);
+  assert.equal(b.length, 1);
+  assert.equal(b[0].closeLine, 5);
+  assert.deepEqual(b[0].body, ["start: 2026-09-28 10:00", "", "note: kept"]);
+  const out = applyEdit(text, planFinish(text, d(2026, 9, 28, 10), d(2026, 9, 28, 10, 5))!);
+  assert.ok(out.endsWith("\nParagraph\n```\nafter"), out);
+  // a properly closed block in a list item still works
+  const ok = "1. step\n   ```timebox\n   start: 2026-09-28 10:00\n   ```\n2. next";
+  assert.equal(findBlocks(ok)[0].closed, true);
+});
+
+test("indentation rules: 4-space indented code isn't a fence; a 4-space indented ``` doesn't close", () => {
+  assert.equal(findBlocks("para\n\n    ```timebox\n    start: 2026-09-28 10:00\n    ```").length, 0);
+  const b = findBlocks("```timebox\nstart: 2026-09-28 10:00\n    ```\nnote: x\n```");
+  assert.equal(b[0].closeLine, 4);
+  assert.deepEqual(b[0].session.extra, ["    ```", "note: x"]);
+  // nested list with deeper indentation is still a fence
+  assert.equal(findBlocks("- a\n  - b\n    ```timebox\n    start: 2026-09-28 10:00\n    ```").length, 1);
+});
+
+test("same start twice: the running block is finished, the finished one is left alone", () => {
+  const text =
+    "```timebox\nstart: 2026-09-28 10:00\nend: 2026-09-28 10:30\n```\n\n```timebox\nstart: 2026-09-28 10:00\n```";
+  const out = applyEdit(text, planFinish(text, d(2026, 9, 28, 10), d(2026, 9, 28, 12))!);
+  assert.ok(out.startsWith("```timebox\nstart: 2026-09-28 10:00\nend: 2026-09-28 10:30\n```"), out);
+  assert.ok(out.endsWith("start: 2026-09-28 10:00:00\nend: 2026-09-28 12:00:00\nduration: 2h\n```"), out);
+});
+
+test("finishing an already finished block (end typed by hand) changes nothing", () => {
+  const text = "```timebox\nstart: 2026-09-28 10:00\nend: 10:25\n```";
+  const edit = planFinish(text, d(2026, 9, 28, 10), d(2026, 9, 28, 21, 40))!;
+  assert.equal(edit.unchanged, true);
+  assert.equal(applyEdit(text, edit), text);
+});
+
+test("DST: a bare end on the next day keeps its wall-clock time", () => {
+  // Find DST changes in the current time zone (none in UTC; CI runs this in several zones).
+  for (let t = d(2026, 1, 1).getTime(); t < d(2027, 1, 1).getTime(); t += 30 * MIN) {
+    if (new Date(t).getTimezoneOffset() === new Date(t + 30 * MIN).getTimezoneOffset()) continue;
+    const change = new Date(t + 30 * MIN);
+    const eve = new Date(change.getFullYear(), change.getMonth(), change.getDate() - 1, 23, 0);
+    const s = ok(`start: ${formatStamp(eve)}\nend: 05:00`);
+    assert.equal(formatStamp(s.end!).slice(11), "05:00:00", `end became ${formatStamp(s.end!)}`);
+    assert.equal(dayDiff(s.start, s.end!), 1);
+  }
+});
+
+test("mixed line endings: blocks are found and untouched lines keep their own endings", () => {
+  const text = "a\r\nb\n```timebox\nstart: 2026-09-28 10:00\n```\r\nc\r\n";
+  assert.equal(findBlocks(text).length, 1);
+  const out = applyEdit(text, planFinish(text, d(2026, 9, 28, 10), d(2026, 9, 28, 10, 30))!);
+  assert.equal(out, "a\r\nb\n```timebox\nstart: 2026-09-28 10:00:00\nend: 2026-09-28 10:30:00\nduration: 30m\n```\r\nc\r\n");
+});
+
+test("years below 1000 round-trip", () => {
+  assert.equal(formatStamp(parseStamp("0050-01-01 10:00")!), "0050-01-01 10:00:00");
+  assert.equal(formatStamp(parseStamp(formatStamp(parseStamp("0500-06-15 10:00")!))!), "0500-06-15 10:00:00");
+});
+
+test("pomodoro: non-finite elapsed time is treated as 0", () => {
+  for (const x of [NaN, Infinity, -Infinity]) {
+    const p = pomodoroPhase(x, cfg);
+    assert.equal(p.kind, "work");
+    assert.equal(p.index, 0);
+    assert.equal(p.elapsedInPhase, 0);
+  }
+});
+
+const BLOCK = "```timebox\ntopic: T\nstart: 2026-09-28 10:00:00\n```";
+const insert = (text: string, line: number) => {
+  const p = planInsert(text, line, BLOCK);
+  const lines = text.split("\n");
+  const off = (pos: { line: number; ch: number }) =>
+    lines.slice(0, pos.line).reduce((n, l) => n + l.length + 1, 0) + pos.ch;
+  const out = text.slice(0, off(p.from)) + p.text + text.slice(off(p.to));
+  return { out, plan: p };
+};
+
+test("planInsert: empty line is replaced, non-empty line gets the block below, cursor under it", () => {
+  let r = insert("a\n\nb", 1);
+  assert.equal(r.out, "a\n" + BLOCK + "\n\nb");
+  assert.deepEqual(r.plan.cursor, { line: 5, ch: 0 });
+  r = insert("a\n\nb", 0);
+  assert.equal(r.out, "a\n" + BLOCK + "\n\nb", "an existing empty line below is reused");
+  assert.deepEqual(r.plan.cursor, { line: 5, ch: 0 });
+  r = insert("a\nb", 1);
+  assert.equal(r.out, "a\nb\n" + BLOCK + "\n");
+  assert.equal(findBlocks(r.out).length, 1);
+});
+
+test("planInsert: inside a callout the block keeps the quote prefix", () => {
+  const r = insert("> [!note]\n> line\n> more", 1);
+  assert.equal(r.out, "> [!note]\n> line\n> ```timebox\n> topic: T\n> start: 2026-09-28 10:00:00\n> ```\n> \n> more");
+  assert.deepEqual(r.plan.cursor, { line: 6, ch: 2 });
+  assert.equal(findBlocks(r.out).length, 1);
+  const r2 = insert("> [!note]\n> ", 1);
+  assert.equal(r2.out, "> [!note]\n> ```timebox\n> topic: T\n> start: 2026-09-28 10:00:00\n> ```\n> ");
+  assert.equal(findBlocks(r2.out).length, 1);
+});
+
+test("planInsert: inside another code block the block goes below it", () => {
+  const r = insert("```js\nlet a = 1\n\nlet b = 2\n```\nafter", 2);
+  assert.equal(r.out, "```js\nlet a = 1\n\nlet b = 2\n```\n" + BLOCK + "\n\nafter");
+  assert.equal(findBlocks(r.out).length, 1);
+  // an unclosed code block runs to the end, so the block goes above it
+  const r2 = insert("intro\n```js\nlet a = 1", 2);
+  assert.equal(r2.out, "intro\n" + BLOCK + "\n\n```js\nlet a = 1");
+  assert.equal(findBlocks(r2.out).length, 1);
+  assert.deepEqual(r2.plan.cursor, { line: 5, ch: 0 });
+});
+
 // ─────────────── robustness ───────────────
 
 /** Runs fn and returns the elapsed milliseconds. */
@@ -514,10 +653,18 @@ test("fuzz: random notes never throw, and edits only touch the block body", () =
 
     for (const b of findBlocks(text, d(2026, 9, 28))) {
       assert.ok(b.openLine < b.closeLine);
+      const target = findBlockByStart(text, b.session.start, d(2026, 9, 28))!;
+      assert.ok(target, "a found block must be findable by its start");
       const end = new Date(b.session.start.getTime() + 90 * MIN);
       const edit = planFinish(text, b.session.start, end, d(2026, 9, 28));
       assert.ok(edit, "a found block must be editable");
       const out = applyEdit(text, edit!);
+      if (target.session.end) {
+        // already finished (e.g. an end typed by hand): left exactly as it was
+        assert.ok(edit!.unchanged);
+        assert.equal(out, text);
+        continue;
+      }
       const before = text.split("\n");
       const after = out.split("\n");
       const delta = edit!.lines.length - (edit!.toLine - edit!.fromLine);
@@ -525,11 +672,11 @@ test("fuzz: random notes never throw, and edits only touch the block body", () =
       assert.deepEqual(after.slice(0, edit!.fromLine), before.slice(0, edit!.fromLine));
       assert.deepEqual(after.slice(edit!.toLine + delta), before.slice(edit!.toLine));
       // the finished block reads back with the same start and the new end
-      const again = findBlocks(out, d(2026, 9, 28)).find((x) => x.openLine === b.openLine);
+      const again = findBlocks(out, d(2026, 9, 28)).find((x) => x.openLine === target.openLine);
       assert.ok(again, "block must still be found after the edit");
       assert.equal(formatStamp(again!.session.start), formatStamp(b.session.start));
       assert.equal(formatStamp(again!.session.end!), formatStamp(end));
-      // finishing again is idempotent
+      // finishing again changes nothing
       assert.equal(applyEdit(out, planFinish(out, b.session.start, end, d(2026, 9, 28))!), out);
     }
   }

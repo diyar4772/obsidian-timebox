@@ -14,6 +14,7 @@ import {
   parseBlock,
   parseStamp,
   planFinish,
+  planInsert,
   pomodoroPhase,
 } from "./core";
 import { TimeboxSettingTab, TimeboxSettings, pomodoroConfig, sanitizeSettings } from "./settings";
@@ -213,6 +214,11 @@ export default class TimeboxPlugin extends Plugin {
     const selection = editor.getSelection().replace(/\s+/g, " ").trim().slice(0, 200);
     const input = await new TopicModal(this.app, selection, file.basename, mode).ask();
     if (input === null) return; // cancelled
+    // The note may have been deleted, or the view switched to another note, while the modal was open.
+    if (!(this.app.vault.getAbstractFileByPath(file.path) instanceof TFile) || ctx.file?.path !== file.path) {
+      new Notice("The note changed while the dialog was open; no session was started.");
+      return;
+    }
     const topic = input || file.basename;
 
     const now = new Date();
@@ -228,6 +234,11 @@ export default class TimeboxPlugin extends Plugin {
 
     const session: Session = { topic, start: now, end: null, mode, extra: [] };
     this.insertBlock(editor, buildBlock(session));
+    // Safety net: only track the session if the inserted block can actually be found again.
+    if (!findBlockByStart(editor.getValue(), now, this.fileDay(file.path))) {
+      new Notice("The session block couldn't be placed here. Try an empty line outside other blocks.");
+      return;
+    }
 
     const entry: ActiveEntry = { path: file.path, start: formatStamp(now), topic, mode };
     if (!this.findEntry(entry)) this.active.push(entry);
@@ -236,28 +247,14 @@ export default class TimeboxPlugin extends Plugin {
   }
 
   /**
-   * Inserts the block at the cursor line: replacing the line if it's empty, below it otherwise.
-   * Done with a single replaceRange (one undo step). The cursor moves to the empty line below the block.
+   * Inserts the block at the cursor (see planInsert: empty line → replaced, otherwise below;
+   * kept inside callouts; moved below a code block the cursor is in). One replaceRange means
+   * one undo step. The cursor moves to the empty line below the block.
    */
   private insertBlock(editor: Editor, block: string): void {
-    const line = editor.getCursor("to").line;
-    const text = editor.getLine(line);
-    const blockLines = block.split("\n").length;
-    const isEmpty = text.trim() === "";
-    const firstLine = isEmpty ? line : line + 1;
-    const closeLine = firstLine + blockLines - 1;
-
-    // Make sure there's an empty line below the block for the cursor to land on.
-    const nextLine = line + 1; // the line that ends up below the block (numbered before the insert)
-    const needsTrailing = nextLine > editor.lastLine() || editor.getLine(nextLine).trim() !== "";
-    const trailing = needsTrailing ? "\n" : "";
-
-    if (isEmpty) {
-      editor.replaceRange(block + trailing, { line, ch: 0 }, { line, ch: text.length });
-    } else {
-      editor.replaceRange("\n" + block + trailing, { line, ch: text.length });
-    }
-    editor.setCursor({ line: closeLine + 1, ch: 0 });
+    const plan = planInsert(editor.getValue(), editor.getCursor("to").line, block);
+    editor.replaceRange(plan.text, plan.from, plan.to);
+    editor.setCursor(plan.cursor);
   }
 
   // ───────────────────────── finishing ─────────────────────────
@@ -285,8 +282,8 @@ export default class TimeboxPlugin extends Plugin {
       const editor = this.sourceEditorFor(file);
       if (editor) {
         const edit = planFinish(editor.getValue(), start, endAt, dayOf);
-        if (edit) {
-          found = true;
+        if (edit) found = true;
+        if (edit && !edit.unchanged) {
           const replacement = edit.lines.map((l) => l + "\n").join("");
           editor.replaceRange(replacement, { line: edit.fromLine, ch: 0 }, { line: edit.toLine, ch: 0 });
         }
@@ -295,7 +292,7 @@ export default class TimeboxPlugin extends Plugin {
           const edit = planFinish(text, start, endAt, dayOf);
           if (!edit) return text;
           found = true;
-          return applyEdit(text, edit);
+          return applyEdit(text, edit); // unchanged edits return the text as is
         });
       }
     } catch (e) {

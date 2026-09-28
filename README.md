@@ -161,7 +161,7 @@ Requires Node.js 18 or later.
 ```bash
 npm install
 npm run dev     # build in watch mode (main.js)
-npm test        # unit tests for src/core.ts
+npm test        # unit tests for src/core.ts and integration tests for src/main.ts
 npm run build   # type check + production build
 ```
 

@@ -260,6 +260,53 @@ test("status bar shows the newest session and hides when the setting is off", as
   assert.equal(plugin.statusEl.shown, false);
 });
 
+test("an end typed by hand is not overwritten when a new session starts", async () => {
+  modalAnswer = "New";
+  const b = "```timebox\ntopic: Old\nstart: 2026-09-28 09:00:00\nend: 2026-09-28 09:25:00\n```";
+  const { plugin, disk, views } = await setup({ "A.md": "# A\n", "B.md": b }, ["A.md"]);
+  plugin.active.push({ path: "B.md", start: "2026-09-28 09:00:00", topic: "Old", mode: "simple" });
+  views[0].editor.cursor = { line: 1, ch: 0 };
+  await plugin.startFromEditor(views[0].editor, views[0], "simple");
+  assert.equal(disk["B.md"], b);
+  assert.deepEqual(
+    plugin.active.map((a: any) => a.path),
+    ["A.md"]
+  );
+});
+
+test("finishing targets the running copy when a finished block has the same start", async () => {
+  const t = "```timebox\nstart: 2026-09-28 09:00:00\nend: 2026-09-28 09:25:00\n```\n\n```timebox\nstart: 2026-09-28 09:00:00\n```";
+  const { plugin, disk } = await setup({ "B.md": t });
+  plugin.active.push({ path: "B.md", start: "2026-09-28 09:00:00", topic: "", mode: "simple" });
+  await plugin.stopSession(plugin.active[0], new Date(2026, 8, 28, 11));
+  assert.ok(disk["B.md"].startsWith("```timebox\nstart: 2026-09-28 09:00:00\nend: 2026-09-28 09:25:00\n```"));
+  assert.ok(disk["B.md"].endsWith("end: 2026-09-28 11:00:00\nduration: 2h\n```"));
+});
+
+test("starting inside a callout keeps the block in the callout; inside a code block it goes below", async () => {
+  modalAnswer = "T";
+  const { plugin, views } = await setup({ "C.md": "> [!note]\n> line\n> more", "J.md": "```js\nlet a = 1\n\n```\nafter" }, ["C.md", "J.md"]);
+  plugin.settings.autoStopPrevious = false;
+  views[0].editor.cursor = { line: 1, ch: 3 };
+  await plugin.startFromEditor(views[0].editor, views[0], "simple");
+  assert.match(views[0].editor.getValue(), /^> \[!note\]\n> line\n> ```timebox\n> topic: T\n> start: .+\n> ```\n> \n> more$/);
+  views[1].editor.cursor = { line: 2, ch: 0 };
+  await plugin.startFromEditor(views[1].editor, views[1], "simple");
+  assert.match(views[1].editor.getValue(), /^```js\nlet a = 1\n\n```\n```timebox\ntopic: T\nstart: .+\n```\n\nafter$/);
+  assert.equal(plugin.active.length, 2);
+});
+
+test("no session starts if the note was deleted while the dialog was open", async () => {
+  Notice.log = [];
+  modalAnswer = "T";
+  const { plugin, views, tfiles } = await setup({ "A.md": "x" }, ["A.md"]);
+  delete (tfiles as any)["A.md"];
+  await plugin.startFromEditor(views[0].editor, views[0], "simple");
+  assert.equal(views[0].editor.getValue(), "x");
+  assert.equal(plugin.active.length, 0);
+  assert.equal(Notice.log.length, 1);
+});
+
 (async () => {
   let failed = 0;
   for (const t of tests) {

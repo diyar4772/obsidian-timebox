@@ -118,6 +118,20 @@ export class SessionBar extends MarkdownRenderChild {
 
     this.elapsedEl = row.createSpan({ cls: "timebox-elapsed", attr: { "aria-live": "off" } });
 
+    // Blocks outside markdown notes (e.g. Canvas cards) can't be located in a file to finish them.
+    if (this.sourcePath.endsWith(".md")) this.renderFinishButton(row, s);
+
+    if (s.mode === "pomodoro") {
+      const pomo = this.barEl?.createDiv({ cls: "timebox-pomo" });
+      if (pomo) {
+        this.pomoLabelEl = pomo.createDiv({ cls: "timebox-pomo-label" });
+        const track = pomo.createDiv({ cls: "timebox-progress" });
+        this.pomoFillEl = track.createDiv({ cls: "timebox-fill" });
+      }
+    }
+  }
+
+  private renderFinishButton(row: HTMLElement, s: Session): void {
     const btn = row.createEl("button", { cls: "timebox-btn", attr: { "aria-label": "Finish session" } });
     setIcon(btn.createSpan({ cls: "timebox-btn-icon" }), "square");
     btn.createSpan({ text: "Finish" });
@@ -128,15 +142,6 @@ export class SessionBar extends MarkdownRenderChild {
       evt.stopPropagation();
       void this.finish(btn, s);
     });
-
-    if (s.mode === "pomodoro") {
-      const pomo = this.barEl?.createDiv({ cls: "timebox-pomo" });
-      if (pomo) {
-        this.pomoLabelEl = pomo.createDiv({ cls: "timebox-pomo-label" });
-        const track = pomo.createDiv({ cls: "timebox-progress" });
-        this.pomoFillEl = track.createDiv({ cls: "timebox-fill" });
-      }
-    }
   }
 
   private async finish(btn: HTMLButtonElement, s: Session): Promise<void> {

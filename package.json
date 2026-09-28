@@ -10,7 +10,8 @@
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "test": "node esbuild.config.mjs test && node .test-out/core.test.cjs && node .test-out/plugin.test.cjs",
     "typecheck": "tsc -noEmit -skipLibCheck",
-    "version": "node version-bump.mjs && git add manifest.json versions.json"
+    "version": "node version-bump.mjs && git add manifest.json versions.json",
+    "test:tz": "node esbuild.config.mjs test && for tz in UTC Europe/Istanbul America/New_York Europe/London Australia/Lord_Howe; do TZ=$tz node .test-out/core.test.cjs > /dev/null || { echo \"core tests failed in TZ=$tz\"; exit 1; }; done && echo 'core tests passed in all time zones'"
   },
   "keywords": [
     "obsidian",
