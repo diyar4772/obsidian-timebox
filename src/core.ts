@@ -8,19 +8,18 @@ export const BLOCK_LANG = "timebox";
 
 export type SessionMode = "simple" | "pomodoro";
 
-/** A break taken during a session. `to` is null while the session is still paused. */
-export interface Pause {
-  from: Date;
-  to: Date | null;
-}
-
 export interface Session {
   topic: string;
   start: Date;
   end: Date | null;
   mode: SessionMode;
-  /** Breaks in chronological order ("pause:" / "resume:" lines). Only the last one can be open. */
-  pauses: Pause[];
+  /**
+   * Total length of the finished breaks, in ms ("paused:" line). Breaks are kept as one total so
+   * the block stays short however often the session is paused.
+   */
+  pausedMs: number;
+  /** When the current break began ("pause:" line), or null if the session isn't paused. */
+  pausedAt: Date | null;
   /** Unrecognized lines (e.g. "note: p. 42"), in order. Never deleted. */
   extra: string[];
 }
@@ -189,6 +188,7 @@ export function parseBlock(source: string, dayOf?: Date): ParseResult {
   let mode: SessionMode = "simple";
   const extra: string[] = [];
   const events: { kind: "pause" | "resume"; raw: string }[] = [];
+  let pausedRaw: string | null = null;
 
   for (const line of source.split(/\r?\n/)) {
     const f = fieldOf(line);
@@ -213,8 +213,10 @@ export function parseBlock(source: string, dayOf?: Date): ParseResult {
       case "resume":
         events.push({ kind: f.field, raw: f.value });
         break;
-      case "duration":
       case "paused":
+        pausedRaw = f.value;
+        break;
+      case "duration":
         break; // ignored: always recomputed from the other lines
     }
   }
@@ -225,15 +227,18 @@ export function parseBlock(source: string, dayOf?: Date): ParseResult {
   const start = parseStamp(startRaw, dayOf);
   if (!start) return { ok: false, error: `Can't read the start time “${startRaw}”. ${FORMAT_HINT}` };
 
-  // Pauses and resumes must alternate and move forward in time.
-  const pauses: Pause[] = [];
+  // "pause:"/"resume:" must alternate and move forward in time. Plugin-written blocks have at most
+  // one open "pause:" line; older or hand-written ones may hold "pause:"/"resume:" pairs, which are
+  // summed into the total (and written back as a total the next time the block is updated).
+  let closed = 0;
+  let pausedAt: Date | null = null;
+  let hasResume = false;
   let last = start;
   for (const e of events) {
-    const open = pauses.length > 0 && pauses[pauses.length - 1].to === null;
-    if (e.kind === "pause" && open) {
+    if (e.kind === "pause" && pausedAt) {
       return { ok: false, error: "Two “pause:” lines in a row. Add a “resume:” line between them." };
     }
-    if (e.kind === "resume" && !open) {
+    if (e.kind === "resume" && !pausedAt) {
       return { ok: false, error: "A “resume:” line needs a “pause:” line before it." };
     }
     const r = parseNotBefore(e.raw, last);
@@ -246,9 +251,22 @@ export function parseBlock(source: string, dayOf?: Date): ParseResult {
             : `The ${e.kind} time “${e.raw}” is before the line above it.`,
       };
     }
-    if (e.kind === "pause") pauses.push({ from: r.at, to: null });
-    else pauses[pauses.length - 1].to = r.at;
+    if (e.kind === "pause") {
+      pausedAt = r.at;
+    } else {
+      closed += r.at.getTime() - pausedAt!.getTime();
+      pausedAt = null;
+      hasResume = true;
+    }
     last = r.at;
+  }
+
+  // The "paused:" total. With "resume:" lines present it was only a summary of them (written that
+  // way by early 1.1.0 builds), so it's not added a second time.
+  if (pausedRaw !== null && pausedRaw !== "" && !hasResume) {
+    const ms = parseBreak(pausedRaw);
+    if (ms === null) return { ok: false, error: `Can't read the paused time “${pausedRaw}”. Expected e.g. 12m 30s or 1h 5m.` };
+    closed += ms;
   }
 
   let end: Date | null = null;
@@ -258,32 +276,56 @@ export function parseBlock(source: string, dayOf?: Date): ParseResult {
       if (r.error === "format") return { ok: false, error: `Can't read the end time “${endRaw}”. ${FORMAT_HINT}` };
       return {
         ok: false,
-        error: pauses.length > 0 ? "The end time can't be before the last pause or resume." : "The end time can't be before the start time.",
+        error: events.length > 0 ? "The end time can't be before the last pause or resume." : "The end time can't be before the start time.",
       };
     }
     end = r.at;
+    // An end typed by hand while paused: the break lasted until the end.
+    if (pausedAt) {
+      closed += end.getTime() - pausedAt.getTime();
+      pausedAt = null;
+    }
   }
 
-  return { ok: true, session: { topic, start, end, mode, pauses, extra } };
+  return { ok: true, session: { topic, start, end, mode, pausedMs: closed, pausedAt, extra } };
 }
 
 // ───────────────────────── pauses ─────────────────────────
 
-/** The break the session is in right now, or null if it's running or finished. */
-export function openPause(s: Session): Pause | null {
-  const last = s.pauses[s.pauses.length - 1];
-  return !s.end && last && last.to === null ? last : null;
+const RE_BREAK = /^(?:(\d{1,6})\s*h)?\s*(?:(\d{1,6})\s*m)?\s*(?:(\d{1,6})\s*s)?$/i;
+
+/** Reads a break total: "12m 30s", "1h 5m", "45s", "2h". "< 1m" (written by early 1.1.0 builds) is 0. */
+export function parseBreak(raw: string): number | null {
+  const v = raw.trim();
+  if (/^<\s*1\s*m$/i.test(v)) return 0;
+  const m = v.match(RE_BREAK);
+  if (!m || v === "" || (m[1] === undefined && m[2] === undefined && m[3] === undefined)) return null;
+  return ((+(m[1] ?? 0) * 60 + +(m[2] ?? 0)) * 60 + +(m[3] ?? 0)) * 1000;
 }
 
-/** Total break time up to `now` (up to the end for a finished session), in ms. */
+/** Break total with second precision, so adding breaks up never drifts: "1h 2m 5s", "12m", "45s". */
+export function formatBreak(ms: number): string {
+  const total = Math.floor(Math.max(0, ms) / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const sec = total % 60;
+  const parts: string[] = [];
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0) parts.push(`${m}m`);
+  if (sec > 0 || parts.length === 0) parts.push(`${sec}s`);
+  return parts.join(" ");
+}
+
+/** When the current break began, or null if the session is running or finished. */
+export function openPause(s: Session): Date | null {
+  return s.end ? null : s.pausedAt;
+}
+
+/** Total break time up to `now` (up to the end for a finished session), in ms. Never more than the session. */
 export function pausedMs(s: Session, now: number): number {
   const limit = s.end ? s.end.getTime() : now;
-  let total = 0;
-  for (const p of s.pauses) {
-    const to = Math.min(p.to ? p.to.getTime() : limit, limit);
-    total += Math.max(0, to - p.from.getTime());
-  }
-  return total;
+  const open = s.pausedAt && !s.end ? Math.max(0, limit - s.pausedAt.getTime()) : 0;
+  return Math.min(Math.max(0, s.pausedMs) + open, Math.max(0, limit - s.start.getTime()));
 }
 
 /** Time actually worked up to `now` (up to the end for a finished session): elapsed minus breaks. */
@@ -294,64 +336,42 @@ export function workedMs(s: Session, now: number): number {
 
 const laterOf = (a: Date, b: Date) => (a.getTime() >= b.getTime() ? a : b);
 
-/** The latest time written in the session (start, last pause or resume). New events can't precede it. */
-function lastEvent(s: Session): Date {
-  const p = s.pauses[s.pauses.length - 1];
-  return p ? p.to ?? p.from : s.start;
-}
-
 /** Starts a break at `at`. Finished and already paused sessions are returned as they are. */
 export function pauseAt(s: Session, at: Date): Session {
-  if (s.end || openPause(s)) return s;
-  return { ...s, pauses: [...s.pauses, { from: laterOf(at, lastEvent(s)), to: null }] };
+  if (s.end || s.pausedAt) return s;
+  return { ...s, pausedAt: laterOf(at, s.start) };
 }
 
-/** Ends the current break at `at`. Sessions that aren't paused are returned as they are. */
+/** Ends the current break at `at`: its length is added to the total. Sessions that aren't paused are returned as they are. */
 export function resumeAt(s: Session, at: Date): Session {
-  const open = openPause(s);
-  if (!open) return s;
-  return { ...s, pauses: [...s.pauses.slice(0, -1), { from: open.from, to: laterOf(at, open.from) }] };
+  if (s.end || !s.pausedAt) return s;
+  const to = laterOf(at, s.pausedAt);
+  return { ...s, pausedMs: s.pausedMs + (to.getTime() - s.pausedAt.getTime()), pausedAt: null };
 }
 
 /**
  * Finishes the session at `end` (which may be in the past: "I actually stopped at 17:40").
- * Breaks that start at or after the end are dropped. If the end falls inside a break, or the
- * session is still paused, the session ends where that break began: nobody was working after it.
+ * A paused session ends where its break began: nobody was working after it. Only the break total
+ * is stored, so for an end in the past the total is capped at the session's length.
  */
 export function finishAt(s: Session, end: Date): Session {
   let e = laterOf(end, s.start);
-  const pauses: Pause[] = [];
-  for (const p of s.pauses) {
-    if (p.from.getTime() >= e.getTime()) break;
-    if (p.to === null || p.to.getTime() > e.getTime()) {
-      e = p.from;
-      break;
-    }
-    pauses.push(p);
-  }
-  return { ...s, end: e, pauses };
+  if (s.pausedAt && e.getTime() >= s.pausedAt.getTime()) e = s.pausedAt;
+  return { ...s, end: e, pausedAt: null, pausedMs: Math.min(s.pausedMs, e.getTime() - s.start.getTime()) };
 }
 
 /**
  * Adds a break from `from` to `to` after the fact ("I was away for the last 15 minutes").
- * It is clipped to the session and merged with any breaks it touches; if it reaches a break
- * that is still open, the session stays paused.
+ * It is clipped to the session; if it reaches the current break, that break is moved back to `from`.
  */
 export function addBreak(s: Session, from: Date, to: Date): Session {
   const lo = laterOf(from, s.start).getTime();
   const hi = s.end ? Math.min(to.getTime(), s.end.getTime()) : to.getTime();
   if (!(hi > lo)) return s;
-  const OPEN = Number.POSITIVE_INFINITY;
-  const spans = s.pauses.map((p) => [p.from.getTime(), p.to ? p.to.getTime() : OPEN] as [number, number]);
-  spans.push([lo, hi]);
-  spans.sort((a, b) => a[0] - b[0]);
-  const merged: [number, number][] = [];
-  for (const span of spans) {
-    const prev = merged[merged.length - 1];
-    if (prev && span[0] <= prev[1]) prev[1] = Math.max(prev[1], span[1]);
-    else merged.push([span[0], span[1]]);
+  if (s.pausedAt && !s.end && hi >= s.pausedAt.getTime()) {
+    return lo < s.pausedAt.getTime() ? { ...s, pausedAt: new Date(lo) } : s;
   }
-  return { ...s, pauses: merged.map(([a, b]) => ({ from: new Date(a), to: b === OPEN ? null : new Date(b) })) };
+  return { ...s, pausedMs: s.pausedMs + (hi - lo) };
 }
 
 /**
@@ -372,7 +392,7 @@ export function lastOccurrence(hours: number, minutes: number, now: Date): Date 
 
 /**
  * Canonical lines of a session (field → lines). Absent fields are omitted.
- * All pause and resume lines live under "pause", in order, so they are written as one group.
+ * "pause" holds the open break only; "resume" lines are never written (they are folded into "paused").
  */
 function canonicalLines(s: Session): Partial<Record<Field, string[]>> {
   const out: Partial<Record<Field, string[]>> = {
@@ -380,21 +400,18 @@ function canonicalLines(s: Session): Partial<Record<Field, string[]>> {
   };
   if (s.topic !== "") out.topic = [`topic: ${s.topic}`];
   if (s.mode === "pomodoro") out.mode = ["mode: pomodoro"];
-  if (s.pauses.length > 0) {
-    out.pause = s.pauses.flatMap((p) =>
-      p.to ? [`pause: ${formatStamp(p.from)}`, `resume: ${formatStamp(p.to)}`] : [`pause: ${formatStamp(p.from)}`]
-    );
-  }
   if (s.end) {
     const end = s.end.getTime();
     out.end = [`end: ${formatStamp(s.end)}`];
     out.duration = [`duration: ${formatDuration(workedMs(s, end))}`];
-    if (s.pauses.length > 0) out.paused = [`paused: ${formatDuration(pausedMs(s, end))}`];
   }
+  const total = s.end ? pausedMs(s, s.end.getTime()) : s.pausedMs;
+  if (total > 0) out.paused = [`paused: ${formatBreak(total)}`];
+  if (s.pausedAt && !s.end) out.pause = [`pause: ${formatStamp(s.pausedAt)}`];
   return out;
 }
 
-const FIELD_ORDER: Field[] = ["topic", "start", "mode", "pause", "end", "duration", "paused"];
+const FIELD_ORDER: Field[] = ["topic", "start", "mode", "end", "duration", "paused", "pause"];
 
 /** Builds new block contents (without fences). An empty topic produces no "topic:" line. */
 export function serializeBlock(s: Session): string {
@@ -411,7 +428,7 @@ export function buildBlock(s: Session): string {
  * Rewrites an existing block body with new session data.
  * - Unrecognized lines and blank lines stay where they are.
  * - Known lines are replaced with their canonical form (duplicates collapse to one).
- * - Pause and resume lines are rewritten as one group, where the first of them was.
+ * - Pause and resume lines are replaced by the single open "pause:" line (if any), where the first was.
  * - Missing fields are inserted after the last field that precedes them in canonical order.
  * - `duration` is always written directly below `end`, and `paused` below `duration`.
  */

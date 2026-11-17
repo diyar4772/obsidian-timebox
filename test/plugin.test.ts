@@ -4,7 +4,13 @@
 
 import * as assert from "assert";
 import { Editor, FuzzySuggestModal, MarkdownView, Menu, Notice, TFile } from "obsidian";
-import { formatStamp } from "../src/core";
+import { formatStamp, parseBreak } from "../src/core";
+
+/** The "paused:" total written in a note, in ms (null if there is none). */
+const pausedIn = (text: string) => {
+  const m = text.match(/\npaused: (.+)\n/);
+  return m ? parseBreak(m[1]) : null;
+};
 import { AwayModal, BreakModal, FinishAtModal } from "../src/ui/modals";
 import TimeboxPlugin from "../src/main";
 import { TopicModal } from "../src/ui/topic-modal";
@@ -436,7 +442,8 @@ test("pause and resume through the editor: lines are written and the active entr
   assert.equal(ed.getValue(), paused, "pausing twice changes nothing");
 
   assert.equal(await plugin.resumeSession(ref), true);
-  assert.match(ed.getValue(), new RegExp("pause: " + STAMP.source + "\nresume: " + STAMP.source + "\nnote: keep"));
+  // the open pause becomes part of the total: no "resume:" line, the block stays short
+  assert.equal(ed.getValue(), "# A\n```timebox\ntopic: T\nstart: " + start + "\nnote: keep\n```\nafter", "a pause of under a second adds nothing");
   assert.equal(plugin.active[0].pausedAt, null);
   const resumed = ed.getValue();
   await plugin.resumeSession(ref);
@@ -488,12 +495,13 @@ test("pause command toggles the preferred session and is hidden when nothing is 
   assert.match(views[0].editor.getValue(), /\npause: /);
   cmd.checkCallback(false);
   await new Promise((r) => setTimeout(r, 0));
-  assert.match(views[0].editor.getValue(), /\nresume: /);
+  assert.ok(!views[0].editor.getValue().includes("pause"), "resumed: the open pause line is gone");
+  assert.equal(plugin.active[0].pausedAt, null);
 });
 
 test("status bar: a paused session shows ⏸ and a frozen time; a running one is preferred", async () => {
   const { plugin, renderBlock } = await setup({ "A.md": "", "B.md": "" });
-  renderBlock("A.md", "topic: Paused\nstart: " + ago(60) + "\npause: " + ago(50) + "\nresume: " + ago(40) + "\npause: " + ago(10));
+  renderBlock("A.md", "topic: Paused\nstart: " + ago(60) + "\npaused: 10m\npause: " + ago(10));
   assert.equal(plugin.statusEl.text, "⏸ 40:00 · Paused");
   assert.equal(plugin.active[0].pausedMs, 10 * MINUTE);
   renderBlock("B.md", "topic: Running\nstart: " + ago(90) + "\npause: " + ago(80) + "\nresume: " + ago(20));
@@ -515,9 +523,9 @@ test("cleanup picks up a pause typed by hand in a note that isn't rendered", asy
   assert.equal(plugin.data.active[0].pausedAt, ago(10));
 });
 
-test("finish at an earlier time: the chosen end is written and later breaks are dropped", async () => {
+test("finish at an earlier time: the chosen end is written and a later pause is dropped", async () => {
   const start = ago(120);
-  const body = "```timebox\nstart: " + start + "\npause: " + ago(100) + "\nresume: " + ago(90) + "\npause: " + ago(30) + "\nresume: " + ago(20) + "\n```";
+  const body = "```timebox\nstart: " + start + "\npaused: 10m\npause: " + ago(30) + "\n```";
   const { plugin, disk } = await setup({ "A.md": body });
   plugin.active.push({ path: "A.md", start, topic: "T", mode: "simple" });
   finishAtAnswer = null;
@@ -527,12 +535,12 @@ test("finish at an earlier time: the chosen end is written and later breaks are 
   await plugin.promptFinishAt({ path: "A.md", start });
   assert.equal(
     disk["A.md"],
-    "```timebox\nstart: " + start + "\npause: " + ago(100) + "\nresume: " + ago(90) + "\nend: " + ago(60) + "\nduration: 50m\npaused: 10m\n```"
+    "```timebox\nstart: " + start + "\nend: " + ago(60) + "\nduration: 50m\npaused: 10m\n```"
   );
   assert.equal(plugin.active.length, 0);
 });
 
-test("add a break: the last N minutes become a pause/resume pair and the session keeps running", async () => {
+test("add a break: the last N minutes are added to the total and the session keeps running", async () => {
   const start = ago(45);
   const { plugin, views } = await setup({ "A.md": "```timebox\nstart: " + start + "\n```" }, ["A.md"]);
   breakAnswer = null;
@@ -540,16 +548,13 @@ test("add a break: the last N minutes become a pause/resume pair and the session
   assert.ok(!views[0].editor.getValue().includes("pause"));
   breakAnswer = 15;
   await plugin.promptBreak({ path: "A.md", start });
-  const m = views[0].editor.getValue().match(/\npause: (.+)\nresume: (.+)\n```$/);
-  assert.ok(m, "a closed break was written");
-  assert.equal(at(m![2]) - at(m![1]), 15 * MINUTE);
+  assert.equal(views[0].editor.getValue(), "```timebox\nstart: " + start + "\npaused: 15m\n```");
   assert.equal(plugin.active[0].pausedAt, null);
   assert.equal(plugin.active[0].pausedMs, 15 * MINUTE);
-  // longer than the session: clipped to its start
+  // longer than the session: clipped to its start, and the total never exceeds the session
   breakAnswer = 600;
   await plugin.promptBreak({ path: "A.md", start });
-  assert.match(views[0].editor.getValue(), new RegExp("start: " + start + "\npause: " + start + "\nresume: "));
-  assert.equal((views[0].editor.getValue().match(/pause:/g) ?? []).length, 1, "overlapping breaks are merged");
+  assert.ok(pausedIn(views[0].editor.getValue())! <= 61 * MINUTE);
 });
 
 test("away: after a long gap between ticks, running sessions can count it as a break", async () => {
@@ -580,9 +585,7 @@ test("away: after a long gap between ticks, running sessions can count it as a b
   plugin.lastTick = Date.now() - 42 * MINUTE;
   plugin.tick();
   await flush();
-  const m = disk["A.md"].match(/\npause: (.+)\nresume: (.+)\n```$/);
-  assert.ok(m, "the gap was written as a break");
-  assert.ok(Math.abs(at(m![2]) - at(m![1]) - 42 * MINUTE) <= 1000);
+  assert.ok(Math.abs(pausedIn(disk["A.md"])! - 42 * MINUTE) <= 1000, "the gap was written as a break");
   assert.equal(disk["P.md"], pausedBody, "the paused session is left alone");
 
   // switched off
@@ -615,7 +618,7 @@ test("away on startup: the time Obsidian was closed is offered, clipped to the s
   store["timebox-last-seen"] = String(Date.now() - 20 * MINUTE);
   await plugin.checkAwayOnStartup();
   assert.equal(awayAsked.length, 1);
-  assert.match(disk["A.md"], /\npause: .+\nresume: .+\n```$/);
+  assert.ok(Math.abs(pausedIn(disk["A.md"])! - 20 * MINUTE) <= 1000);
 
   // closed since before the session existed (e.g. started on another device): from its start
   disk["A.md"] = "```timebox\nstart: " + start + "\n```";
@@ -623,7 +626,7 @@ test("away on startup: the time Obsidian was closed is offered, clipped to the s
   store["timebox-last-seen"] = String(Date.now() - 500 * MINUTE);
   await plugin.checkAwayOnStartup();
   assert.equal(formatStamp(awayAsked[1].from), start);
-  assert.match(disk["A.md"], new RegExp("\npause: " + start + "\nresume: "));
+  assert.ok(Math.abs(pausedIn(disk["A.md"])! - 30 * MINUTE) <= 1000, "clipped to the session's start");
 });
 
 test("long session limit: quiet when first seen, then reminds, pauses or finishes", async () => {

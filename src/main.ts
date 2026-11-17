@@ -21,7 +21,6 @@ import {
   parseBlock,
   parseStamp,
   pauseAt,
-  pausedMs,
   planChange,
   planFinish,
   planInsert,
@@ -277,8 +276,8 @@ export default class TimeboxPlugin extends Plugin {
   /** Copies topic, mode and pause state from the block into the entry. Returns whether anything changed. */
   private syncEntry(a: ActiveEntry, s: Session): boolean {
     const open = openPause(s);
-    const pausedAt = open ? formatStamp(open.from) : null;
-    const paused = pausedMs(s, open ? open.from.getTime() : Number.POSITIVE_INFINITY);
+    const pausedAt = open ? formatStamp(open) : null;
+    const paused = s.pausedMs;
     if (a.topic === s.topic && a.mode === s.mode && (a.pausedMs ?? 0) === paused && (a.pausedAt ?? null) === pausedAt) return false;
     a.topic = s.topic;
     a.mode = s.mode;
@@ -344,7 +343,7 @@ export default class TimeboxPlugin extends Plugin {
     for (const a of this.active) taken.add(a.start);
     while (taken.has(formatStamp(now))) now.setSeconds(now.getSeconds() + 1);
 
-    const session: Session = { topic, start: now, end: null, mode, pauses: [], extra: [] };
+    const session: Session = { topic, start: now, end: null, mode, pausedMs: 0, pausedAt: null, extra: [] };
     const block = buildBlock(session);
     // Dry run first: if the block can't be placed cleanly here, change nothing (not even
     // the previous sessions).

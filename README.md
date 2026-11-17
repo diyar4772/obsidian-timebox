@@ -47,7 +47,7 @@ Everything is stored as plain text in the note itself, so your sessions stay rea
 
 ### Breaks
 
-- Select **Pause** on the bar (or run **Pause or resume active session**). The timer stops, the bar turns orange and shows `Paused for 04:13 · Breaks: 16m (2)`. Select **Resume** to carry on.
+- Select **Pause** on the bar (or run **Pause or resume active session**). The timer stops, the bar turns orange and shows `Paused for 04:13 · Breaks: 16m 5s`. Select **Resume** to carry on.
 - Forgot to pause? Open the **⋯** menu on the bar and choose **Add a break…** (e.g. "the last 15 minutes"), or **Finish at an earlier time…** if you stopped working a while ago.
 - If the computer sleeps or Obsidian is closed while a session runs, you're asked on return whether that time was a break.
 - A session that has been running for 3 hours reminds you. You can change the limit, or have the session paused or finished instead, in the settings.
@@ -80,14 +80,23 @@ duration: 1h 18m
 ```
 ````
 
-A session with breaks looks like this. `duration` is the time you actually worked; `paused` is the total of the breaks:
+Breaks are kept as one total, so the block stays short however often you pause. While paused, one more line holds when the break began:
 
 ````markdown
 ```timebox
 topic: Math Methods
 start: 2026-09-28 18:29:05
-pause: 2026-09-28 18:50:00
-resume: 2026-09-28 19:02:00
+paused: 12m
+pause: 2026-09-28 19:40:00
+```
+````
+
+When you resume, the `pause:` line is removed and its length is added to `paused:`. A finished session: `duration` is the time you actually worked, `paused` the total of the breaks:
+
+````markdown
+```timebox
+topic: Math Methods
+start: 2026-09-28 18:29:05
 end: 2026-09-28 19:47:05
 duration: 1h 6m
 paused: 12m
@@ -101,11 +110,11 @@ paused: 12m
 | `topic`    | What the session is about. Optional.                                                |
 | `start`    | Start time. **Required.**                                                           |
 | `mode`     | `pomodoro` or `simple`. Defaults to `simple`.                                       |
-| `pause`    | Start of a break. Can appear several times, each followed by a `resume`.            |
-| `resume`   | End of a break. A `pause` without a `resume` means the session is paused right now. |
+| `paused`   | Total break time, e.g. `12m 30s`. Not counted as work.                              |
+| `pause`    | The session is paused right now, since this time.                                   |
+| `resume`   | Optional, for hand-written breaks: `pause:`/`resume:` pairs are added to the total. |
 | `end`      | End time. Without it, the session is still running.                                 |
 | `duration` | Time worked (breaks excluded). Ignored when reading and recalculated.               |
-| `paused`   | Total break time. Ignored when reading and recalculated.                            |
 
 - Keys are case-insensitive: `Start`, `START` and `start` all work.
 - Lines the plugin doesn't recognize (e.g. `note: p. 42`) are never touched and stay where they are when the block is updated.

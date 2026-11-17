@@ -9,6 +9,7 @@ import {
   formatClock,
   formatDuration,
   formatStamp,
+  formatBreak,
   formatTimer,
   openPause,
   pausedMs,
@@ -110,13 +111,13 @@ export class SessionBar extends MarkdownRenderChild {
           : `${"🍅".repeat(Math.min(n, MAX_TOMATOES))}${n > MAX_TOMATOES ? "…" : ""} ${n} ${n === 1 ? "pomodoro" : "pomodoros"}`
       );
     }
-    if (s.pauses.length > 0) meta.push(this.breaksText(s, end.getTime()));
+    if (pausedMs(s, end.getTime()) > 0) meta.push(this.breaksText(s, end.getTime()));
     if (meta.length > 0) this.barEl?.createDiv({ cls: "timebox-meta", text: meta.join(" · ") });
   }
 
-  /** "Breaks: 12m (2)" */
+  /** "Breaks: 12m 30s" */
   private breaksText(s: Session, now: number): string {
-    return `Breaks: ${formatDuration(pausedMs(s, now))} (${s.pauses.length})`;
+    return `Breaks: ${formatBreak(pausedMs(s, now))}`;
   }
 
   // ───────────── active session ─────────────
@@ -143,7 +144,7 @@ export class SessionBar extends MarkdownRenderChild {
         this.pomoFillEl = track.createDiv({ cls: "timebox-fill" });
       }
     }
-    if (s.pauses.length > 0) this.breaksEl = this.barEl?.createDiv({ cls: "timebox-meta" }) ?? null;
+    if (s.pausedMs > 0 || paused) this.breaksEl = this.barEl?.createDiv({ cls: "timebox-meta" }) ?? null;
   }
 
   private renderActions(row: HTMLElement, s: Session, paused: boolean): void {
@@ -214,7 +215,7 @@ export class SessionBar extends MarkdownRenderChild {
     this.elapsedEl?.setText(formatTimer(elapsed));
     if (this.breaksEl) {
       const breaks = this.breaksText(s, now);
-      this.breaksEl.setText(open ? `Paused for ${formatTimer(now - open.from.getTime())} · ${breaks}` : breaks);
+      this.breaksEl.setText(open ? `Paused for ${formatTimer(now - open.getTime())} · ${breaks}` : breaks);
     }
 
     if (s.mode !== "pomodoro" || !this.pomoLabelEl || !this.pomoFillEl) return;

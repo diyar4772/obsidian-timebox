@@ -5,6 +5,8 @@ import * as assert from "assert";
 import {
   addBreak,
   finishAt,
+  formatBreak,
+  parseBreak,
   lastOccurrence,
   openPause,
   pauseAt,
@@ -156,16 +158,16 @@ test("serializeBlock / buildBlock", () => {
   const start = d(2026, 9, 28, 18, 29, 5);
   const end = d(2026, 9, 28, 19, 47, 5);
   assert.equal(
-    buildBlock({ topic: "Math Methods", start, end: null, mode: "pomodoro", pauses: [], extra: [] }),
+    buildBlock({ topic: "Math Methods", start, end: null, mode: "pomodoro", pausedMs: 0, pausedAt: null, extra: [] }),
     "```timebox\ntopic: Math Methods\nstart: 2026-09-28 18:29:05\nmode: pomodoro\n```"
   );
   assert.equal(
-    serializeBlock({ topic: "Math Methods", start, end, mode: "pomodoro", pauses: [], extra: ["note: p. 42"] }),
+    serializeBlock({ topic: "Math Methods", start, end, mode: "pomodoro", pausedMs: 0, pausedAt: null, extra: ["note: p. 42"] }),
     "topic: Math Methods\nstart: 2026-09-28 18:29:05\nmode: pomodoro\n" +
       "end: 2026-09-28 19:47:05\nduration: 1h 18m\nnote: p. 42"
   );
   // a serialized block parses back to the same session
-  const back = ok(serializeBlock({ topic: "A", start, end, mode: "simple", pauses: [], extra: [] }));
+  const back = ok(serializeBlock({ topic: "A", start, end, mode: "simple", pausedMs: 0, pausedAt: null, extra: [] }));
   assert.equal(formatStamp(back.end!), formatStamp(end));
   assert.equal(back.mode, "simple");
 });
@@ -174,7 +176,7 @@ test("rewriteBody: unrecognized lines stay in place, missing fields are inserted
   const start = d(2026, 9, 28, 10, 0);
   const end = d(2026, 9, 28, 11, 5);
   const body = ["Topic: Chemistry", "note: p. 42", "START: 10:00", "", "- another note"];
-  const out = rewriteBody(body, { topic: "Chemistry", start, end, mode: "simple", pauses: [], extra: [] });
+  const out = rewriteBody(body, { topic: "Chemistry", start, end, mode: "simple", pausedMs: 0, pausedAt: null, extra: [] });
   assert.deepEqual(out, [
     "topic: Chemistry",
     "note: p. 42",
@@ -187,7 +189,7 @@ test("rewriteBody: unrecognized lines stay in place, missing fields are inserted
 
   // an existing end is updated in place; the stale duration is removed and rewritten
   const body2 = ["start: 2026-09-28 10:00", "duration: wrong", "end: 10:30", "note: x"];
-  const out2 = rewriteBody(body2, { topic: "", start, end, mode: "simple", pauses: [], extra: [] });
+  const out2 = rewriteBody(body2, { topic: "", start, end, mode: "simple", pausedMs: 0, pausedAt: null, extra: [] });
   // no "topic:" line is added when the topic is empty
   assert.deepEqual(out2, [
     "start: 2026-09-28 10:00:00",
@@ -323,7 +325,8 @@ test("blockquoted (>) and indented blocks keep their prefix", () => {
     start: d(2026, 9, 28, 10),
     end: d(2026, 9, 28, 10, 30),
     mode: "simple",
-    pauses: [],
+    pausedMs: 0,
+    pausedAt: null,
     extra: [],
   })!;
   assert.equal(
@@ -780,36 +783,69 @@ function rng(seed: number) {
 
 // ─────────────── pauses ───────────────
 
-const PAUSED_BODY = [
-  "topic: Math",
-  "start: 2026-09-28 10:00:00",
-  "pause: 2026-09-28 10:30:00",
-  "resume: 2026-09-28 10:42:00",
-  "pause: 2026-09-28 11:00:00",
-].join("\n");
+const at = (h: number, m: number, sec = 0) => d(2026, 9, 28, h, m, sec);
 
-test("pause/resume lines are parsed in order; only the last pause can be open", () => {
-  const s = ok(PAUSED_BODY);
-  assert.equal(s.pauses.length, 2);
-  assert.equal(formatStamp(s.pauses[0].to!), "2026-09-28 10:42:00");
-  assert.equal(s.pauses[1].to, null);
-  assert.equal(openPause(s), s.pauses[1]);
-  // 10:00–10:30 and 10:42–11:00 worked, whatever the time is afterwards
-  assert.equal(workedMs(s, d(2026, 9, 28, 13).getTime()), 48 * MIN);
-  assert.equal(pausedMs(s, d(2026, 9, 28, 11, 10).getTime()), 22 * MIN);
-  // a running session counts up to now
-  assert.equal(workedMs(ok("start: 2026-09-28 10:00\npause: 10:10\nresume: 10:15"), d(2026, 9, 28, 10, 30).getTime()), 25 * MIN);
-  assert.equal(openPause(ok("start: 2026-09-28 10:00\npause: 10:10\nresume: 10:15")), null);
+test("compact form: a paused total plus at most one open pause line", () => {
+  const s = ok("topic: Math\nstart: 2026-09-28 10:00:00\npaused: 12m 30s\npause: 2026-09-28 11:00:00");
+  assert.equal(s.pausedMs, 12.5 * MIN);
+  assert.equal(formatStamp(openPause(s)!), "2026-09-28 11:00:00");
+  // 10:00–11:00 minus 12.5 min worked, frozen while paused
+  assert.equal(workedMs(s, at(13, 0).getTime()), 47.5 * MIN);
+  assert.equal(pausedMs(s, at(11, 10).getTime()), 22.5 * MIN);
+  const running = ok("start: 2026-09-28 10:00\npaused: 5m");
+  assert.equal(openPause(running), null);
+  assert.equal(workedMs(running, at(10, 30).getTime()), 25 * MIN);
 });
 
-test("bare pause times follow the line above them, across midnight too", () => {
-  const s = ok("start: 2026-09-28 23:50\npause: 23:55\nresume: 00:10\npause: 00:20\nresume: 00:25\nend: 00:40");
-  assert.equal(formatStamp(s.pauses[0].to!), "2026-09-29 00:10:00");
-  assert.equal(formatStamp(s.pauses[1].from), "2026-09-29 00:20:00");
-  assert.equal(formatStamp(s.end!), "2026-09-29 00:40:00");
-  assert.equal(workedMs(s, 0), 30 * MIN);
+test("parseBreak / formatBreak round-trip with second precision", () => {
+  assert.equal(parseBreak("12m 30s"), 12.5 * MIN);
+  assert.equal(parseBreak("1h 5m"), 65 * MIN);
+  assert.equal(parseBreak("2H"), 120 * MIN);
+  assert.equal(parseBreak("45s"), 45_000);
+  assert.equal(parseBreak("< 1m"), 0);
+  assert.equal(parseBreak("soon"), null);
+  assert.equal(parseBreak(""), null);
+  assert.equal(parseBreak("5"), null);
+  for (const ms of [1000, 59_000, 60_000, 61_000, 3_600_000, 3_723_000, 100 * 3_600_000 + 1000]) {
+    assert.equal(parseBreak(formatBreak(ms)), ms);
+  }
+  assert.equal(formatBreak(3_723_999), "1h 2m 3s");
+  assert.equal(formatBreak(0), "0s");
+});
+
+test("old pause/resume pairs are still read and summed; their paused summary isn't added twice", () => {
+  // as written by early 1.1.0 builds (the user's block)
+  const s = ok(
+    "topic: SA\nstart: 2026-11-17 12:09:24\npause: 2026-11-17 12:09:26\nresume: 2026-11-17 12:09:29\n" +
+      "pause: 2026-11-17 12:09:30\nresume: 2026-11-17 12:09:31\nend: 2026-11-17 12:09:32\nduration: < 1m\npaused: < 1m"
+  );
+  assert.equal(s.pausedMs, 4000);
+  assert.equal(workedMs(s, 0), 4000);
+  // hand-typed pairs across midnight, ending paused
+  const t = ok("start: 2026-09-28 23:50\npause: 23:55\nresume: 00:10\npause: 00:20");
+  assert.equal(t.pausedMs, 15 * MIN);
+  assert.equal(formatStamp(t.pausedAt!), "2026-09-29 00:20:00");
   // keys are case-insensitive, like the others
-  assert.equal(ok("start: 2026-09-28 10:00\nPAUSE: 10:10\nResume: 10:15").pauses.length, 1);
+  assert.equal(ok("start: 2026-09-28 10:00\nPAUSE: 10:10\nResume: 10:15").pausedMs, 5 * MIN);
+});
+
+test("rewriting folds any number of breaks into two lines at most", () => {
+  const lines = ["topic: T", "start: 2026-09-28 10:00:00"];
+  for (let i = 0; i < 100; i++) {
+    const m = 1 + i * 2;
+    lines.push(`pause: 2026-09-28 ${String(10 + Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}:00`);
+    lines.push(`resume: 2026-09-28 ${String(10 + Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}:30`);
+  }
+  lines.push("note: stays");
+  const s = ok(lines.join("\n"));
+  assert.equal(s.pausedMs, 100 * 30_000);
+  assert.deepEqual(rewriteBody(lines, pauseAt(s, at(14, 0))), [
+    "topic: T",
+    "start: 2026-09-28 10:00:00",
+    "paused: 50m",
+    "pause: 2026-09-28 14:00:00",
+    "note: stays",
+  ]);
 });
 
 test("broken pause lines give clear errors", () => {
@@ -823,148 +859,127 @@ test("broken pause lines give clear errors", () => {
   assert.match(err("start: 2026-09-28 10:00\npause: soon"), /Can't read the pause time/);
   assert.match(err("start: 2026-09-28 10:00\npause:"), /Can't read the pause time/);
   assert.match(err("start: 2026-09-28 10:00\npause: 2026-09-28 09:00"), /before the line above/);
-  assert.match(err("start: 2026-09-28 10:00\npause: 10:10\nresume: 2026-09-28 10:05"), /before the line above/);
-  assert.match(err("start: 2026-09-28 10:00\npause: 10:10\nresume: 10:20\nend: 2026-09-28 10:15"), /last pause or resume/);
+  assert.match(err("start: 2026-09-28 10:00\npaused: a while"), /Can't read the paused time/);
+  assert.match(err("start: 2026-09-28 10:00\npause: 10:10\nend: 2026-09-28 10:05"), /last pause or resume/);
   assert.match(err("start: 2026-09-28 10:00\nend: 2026-09-28 09:00"), /before the start time/);
 });
 
 test("a hand-typed end while paused: the break runs until the end", () => {
-  const s = ok("start: 2026-09-28 10:00\npause: 10:30\nend: 11:00");
+  const s = ok("start: 2026-09-28 10:00\npaused: 5m\npause: 10:30\nend: 11:00");
   assert.equal(openPause(s), null);
-  assert.equal(workedMs(s, 0), 30 * MIN);
-  assert.equal(pausedMs(s, 0), 30 * MIN);
+  assert.equal(pausedMs(s, 0), 35 * MIN);
+  assert.equal(workedMs(s, 0), 25 * MIN);
 });
 
 test("pauseAt / resumeAt: only running sessions pause, only paused ones resume", () => {
   const running = ok("start: 2026-09-28 10:00");
-  const paused = pauseAt(running, d(2026, 9, 28, 10, 20));
-  assert.equal(formatStamp(openPause(paused)!.from), "2026-09-28 10:20:00");
-  assert.equal(pauseAt(paused, d(2026, 9, 28, 10, 25)), paused, "already paused: same object");
-  assert.equal(resumeAt(running, d(2026, 9, 28, 10, 25)), running, "not paused: same object");
-  const resumed = resumeAt(paused, d(2026, 9, 28, 10, 25));
+  const paused = pauseAt(running, at(10, 20));
+  assert.equal(formatStamp(openPause(paused)!), "2026-09-28 10:20:00");
+  assert.equal(pauseAt(paused, at(10, 25)), paused, "already paused: same object");
+  assert.equal(resumeAt(running, at(10, 25)), running, "not paused: same object");
+  const resumed = resumeAt(paused, at(10, 25));
   assert.equal(openPause(resumed), null);
-  assert.equal(workedMs(resumed, d(2026, 9, 28, 10, 40).getTime()), 35 * MIN);
+  assert.equal(resumed.pausedMs, 5 * MIN);
+  assert.equal(workedMs(resumed, at(10, 40).getTime()), 35 * MIN);
+  const again = resumeAt(pauseAt(resumed, at(10, 50)), at(10, 51, 30));
+  assert.equal(again.pausedMs, 6.5 * MIN);
   const done = ok("start: 2026-09-28 10:00\nend: 11:00");
-  assert.equal(pauseAt(done, d(2026, 9, 28, 10, 20)), done, "finished: same object");
-  // a clock that went backwards never produces lines out of order
-  const early = pauseAt(running, d(2026, 9, 28, 9, 0));
-  assert.equal(formatStamp(openPause(early)!.from), "2026-09-28 10:00:00");
-  assert.equal(formatStamp(resumeAt(paused, d(2026, 9, 28, 10, 0)).pauses[0].to!), "2026-09-28 10:20:00");
+  assert.equal(pauseAt(done, at(10, 20)), done, "finished: same object");
+  // a clock that went backwards never produces times out of order
+  assert.equal(formatStamp(openPause(pauseAt(running, at(9, 0)))!), "2026-09-28 10:00:00");
+  assert.equal(resumeAt(paused, at(10, 0)).pausedMs, 0);
 });
 
-test("finishAt: a paused session ends where the break began; a backdated end drops later breaks", () => {
-  const s = ok(PAUSED_BODY);
-  const a = finishAt(s, d(2026, 9, 28, 14));
+test("finishAt: a paused session ends where the break began; the total never exceeds the session", () => {
+  const s = ok("start: 2026-09-28 10:00\npaused: 12m\npause: 11:00");
+  const a = finishAt(s, at(14, 0));
   assert.equal(formatStamp(a.end!), "2026-09-28 11:00:00");
-  assert.equal(a.pauses.length, 1);
+  assert.equal(a.pausedAt, null);
   assert.equal(workedMs(a, 0), 48 * MIN);
-  // "I actually stopped at 10:35": inside the first break → ends at 10:30, no breaks left
-  const b = finishAt(s, d(2026, 9, 28, 10, 35));
-  assert.equal(formatStamp(b.end!), "2026-09-28 10:30:00");
-  assert.equal(b.pauses.length, 0);
-  // between the breaks
-  const c = finishAt(s, d(2026, 9, 28, 10, 50));
-  assert.equal(formatStamp(c.end!), "2026-09-28 10:50:00");
-  assert.equal(c.pauses.length, 1);
-  assert.equal(workedMs(c, 0), 38 * MIN);
+  // "I actually stopped at 10:50": before the open break → it is dropped
+  const b = finishAt(s, at(10, 50));
+  assert.equal(formatStamp(b.end!), "2026-09-28 10:50:00");
+  assert.equal(workedMs(b, 0), 38 * MIN);
+  // "10:05": the total is capped at the session's length
+  const c = finishAt(s, at(10, 5));
+  assert.equal(c.pausedMs, 5 * MIN);
+  assert.equal(workedMs(c, 0), 0);
   // never before the start
-  assert.equal(formatStamp(finishAt(s, d(2026, 9, 28, 9)).end!), "2026-09-28 10:00:00");
+  assert.equal(formatStamp(finishAt(s, at(9, 0)).end!), "2026-09-28 10:00:00");
 });
 
-test("addBreak: clipped to the session and merged with the breaks it touches", () => {
-  const running = ok("start: 2026-09-28 10:00\npause: 10:30\nresume: 10:40");
-  const a = addBreak(running, d(2026, 9, 28, 11), d(2026, 9, 28, 11, 15));
-  assert.deepEqual(a.pauses.map((p) => formatStamp(p.from).slice(11, 16) + "-" + formatStamp(p.to!).slice(11, 16)), ["10:30-10:40", "11:00-11:15"]);
-  // overlapping and earlier than existing ones
-  const b = addBreak(a, d(2026, 9, 28, 10, 35), d(2026, 9, 28, 11, 5));
-  assert.deepEqual(b.pauses.map((p) => formatStamp(p.from).slice(11, 16) + "-" + formatStamp(p.to!).slice(11, 16)), ["10:30-11:15"]);
-  const c = addBreak(running, d(2026, 9, 28, 9), d(2026, 9, 28, 10, 5));
-  assert.equal(formatStamp(c.pauses[0].from), "2026-09-28 10:00:00");
-  assert.equal(c.pauses.length, 2);
-  // reaching an open break moves its start back and keeps the session paused
-  const paused = pauseAt(running, d(2026, 9, 28, 11, 30));
-  const e = addBreak(paused, d(2026, 9, 28, 11, 20), d(2026, 9, 28, 11, 45));
-  assert.equal(formatStamp(openPause(e)!.from), "2026-09-28 11:20:00");
-  assert.equal(e.pauses.length, 2);
+test("addBreak: clipped to the session; reaching the open break moves it back", () => {
+  const running = ok("start: 2026-09-28 10:00\npaused: 10m");
+  assert.equal(addBreak(running, at(11, 0), at(11, 15)).pausedMs, 25 * MIN);
+  assert.equal(addBreak(running, at(9, 0), at(10, 5)).pausedMs, 15 * MIN, "clipped to the start");
+  const paused = pauseAt(running, at(11, 30));
+  const e = addBreak(paused, at(11, 20), at(11, 45));
+  assert.equal(formatStamp(openPause(e)!), "2026-09-28 11:20:00");
+  assert.equal(e.pausedMs, 10 * MIN);
+  assert.equal(addBreak(paused, at(11, 35), at(11, 40)), paused, "inside the open break: nothing to add");
   // empty or inverted ranges change nothing
-  assert.equal(addBreak(running, d(2026, 9, 28, 11), d(2026, 9, 28, 11)), running);
-  assert.equal(addBreak(running, d(2026, 9, 28, 9), d(2026, 9, 28, 9, 30)), running);
-  // every result reads back the same
-  for (const s of [a, b, c, e]) assert.equal(serializeBlock(ok(serializeBlock(s))), serializeBlock(s));
+  assert.equal(addBreak(running, at(11, 0), at(11, 0)), running);
+  assert.equal(addBreak(running, at(9, 0), at(9, 30)), running);
+  // a finished session: clipped to the end
+  assert.equal(addBreak(ok("start: 2026-09-28 10:00\nend: 11:00"), at(10, 50), at(12, 0)).pausedMs, 10 * MIN);
 });
 
-test("writing: pause lines sit between mode and end; duration is net, paused is the break total", () => {
-  const s = finishAt(resumeAt(ok(PAUSED_BODY + "\nmode: pomodoro\nnote: p. 42"), d(2026, 9, 28, 11, 10)), d(2026, 9, 28, 12));
+test("writing: paused sits below duration; the open pause goes last", () => {
+  const s = finishAt(resumeAt(ok("topic: Math\nstart: 2026-09-28 10:00:00\nmode: pomodoro\npaused: 12m\npause: 11:00\nnote: p. 42"), at(11, 10)), at(12, 0));
   assert.equal(
     serializeBlock(s),
-    [
-      "topic: Math",
-      "start: 2026-09-28 10:00:00",
-      "mode: pomodoro",
-      "pause: 2026-09-28 10:30:00",
-      "resume: 2026-09-28 10:42:00",
-      "pause: 2026-09-28 11:00:00",
-      "resume: 2026-09-28 11:10:00",
-      "end: 2026-09-28 12:00:00",
-      "duration: 1h 38m",
-      "paused: 22m",
-      "note: p. 42",
-    ].join("\n")
+    ["topic: Math", "start: 2026-09-28 10:00:00", "mode: pomodoro", "end: 2026-09-28 12:00:00", "duration: 1h 38m", "paused: 22m", "note: p. 42"].join("\n")
+  );
+  assert.equal(
+    serializeBlock(pauseAt(ok("start: 2026-09-28 10:00\npaused: 30s"), at(10, 20))),
+    "start: 2026-09-28 10:00:00\npaused: 30s\npause: 2026-09-28 10:20:00"
   );
   // sessions without breaks get no "paused:" line
   assert.ok(!serializeBlock(ok("start: 2026-09-28 10:00\nend: 11:00")).includes("paused"));
 });
 
-test("rewriteBody: pause lines are rewritten as one group where the first one was; other lines stay", () => {
+test("rewriteBody: notes stay in place around the break lines", () => {
   const body = ["topic: T", "note: one", "start: 2026-09-28 10:00", "pause: 10:10", "note: two", "resume: 10:20", "", "paused: 99h"];
-  const s = pauseAt(ok(body.join("\n")), d(2026, 9, 28, 10, 30));
-  assert.deepEqual(rewriteBody(body, s), [
+  assert.deepEqual(rewriteBody(body, pauseAt(ok(body.join("\n")), at(10, 30))), [
     "topic: T",
     "note: one",
     "start: 2026-09-28 10:00:00",
-    "pause: 2026-09-28 10:10:00",
-    "resume: 2026-09-28 10:20:00",
+    "paused: 10m",
     "pause: 2026-09-28 10:30:00",
     "note: two",
     "",
   ]);
-  // first pause in a block without any: goes after start/mode, before the notes that follow
-  assert.deepEqual(rewriteBody(["start: 2026-09-28 10:00", "mode: pomodoro", "note: x"], pauseAt(ok("start: 2026-09-28 10:00\nmode: pomodoro"), d(2026, 9, 28, 10, 5))), [
-    "start: 2026-09-28 10:00:00",
-    "mode: pomodoro",
-    "pause: 2026-09-28 10:05:00",
-    "note: x",
-  ]);
   // finishing while paused removes the open pause and writes net duration
-  assert.deepEqual(rewriteBody(["start: 2026-09-28 10:00", "pause: 10:05"], finishAt(ok("start: 2026-09-28 10:00\npause: 10:05"), d(2026, 9, 28, 12))), [
+  assert.deepEqual(rewriteBody(["start: 2026-09-28 10:00", "pause: 10:05"], finishAt(ok("start: 2026-09-28 10:00\npause: 10:05"), at(12, 0))), [
     "start: 2026-09-28 10:00:00",
     "end: 2026-09-28 10:05:00",
     "duration: 5m",
   ]);
 });
 
-test("planChange: pauses a running block, leaves finished ones alone, marks no-ops unchanged", () => {
-  const text = "a\n```timebox\ntopic: T\nstart: 2026-09-28 10:00:00\n```\nb";
-  const start = d(2026, 9, 28, 10);
-  const e = planChange(text, start, (s) => pauseAt(s, d(2026, 9, 28, 10, 5)))!;
-  const paused = applyEdit(text, e);
-  assert.equal(paused, "a\n```timebox\ntopic: T\nstart: 2026-09-28 10:00:00\npause: 2026-09-28 10:05:00\n```\nb");
-  assert.ok(planChange(paused, start, (s) => pauseAt(s, d(2026, 9, 28, 10, 6)))!.unchanged);
-  const resumed = applyEdit(paused, planChange(paused, start, (s) => resumeAt(s, d(2026, 9, 28, 10, 9)))!);
-  assert.ok(resumed.includes("resume: 2026-09-28 10:09:00"));
-  const done = applyEdit(resumed, planFinish(resumed, start, d(2026, 9, 28, 11))!);
-  assert.ok(done.includes("duration: 56m\npaused: 4m"));
-  assert.ok(planChange(done, start, (s) => pauseAt(s, d(2026, 9, 28, 11, 5)))!.unchanged);
-  assert.equal(planChange(text, d(2026, 9, 28, 9), (s) => s), null);
+test("planChange: pausing and resuming many times keeps the block short", () => {
+  let text = "a\n```timebox\ntopic: T\nstart: 2026-09-28 10:00:00\n```\nb";
+  const start = at(10, 0);
+  for (let i = 0; i < 50; i++) {
+    text = applyEdit(text, planChange(text, start, (s) => pauseAt(s, at(10, i, 10)))!);
+    assert.ok(planChange(text, start, (s) => pauseAt(s, at(10, i, 20)))!.unchanged);
+    text = applyEdit(text, planChange(text, start, (s) => resumeAt(s, at(10, i, 40)))!);
+  }
+  assert.equal(text, "a\n```timebox\ntopic: T\nstart: 2026-09-28 10:00:00\npaused: 25m\n```\nb");
+  const done = applyEdit(text, planFinish(text, start, at(11, 0))!);
+  assert.ok(done.includes("duration: 35m\npaused: 25m\n```"));
+  assert.ok(planChange(done, start, (s) => pauseAt(s, at(11, 5)))!.unchanged);
+  assert.equal(planChange(text, at(9, 0), (s) => s), null);
 });
 
 test("pomodoro phase follows worked time, so it stands still during a break", () => {
-  const s = ok("start: 2026-09-28 10:00\nmode: pomodoro\npause: 10:20\nresume: 10:50");
-  const at = (h: number, m: number) => pomodoroPhase(workedMs(s, d(2026, 9, 28, h, m).getTime()), cfg);
-  assert.equal(at(10, 20).elapsedInPhase, 20 * MIN);
-  assert.equal(at(10, 45).elapsedInPhase, 20 * MIN);
-  assert.equal(at(10, 54).kind, "work");
-  assert.equal(at(10, 56).kind, "short");
+  const s = ok("start: 2026-09-28 10:00\nmode: pomodoro\npaused: 30m");
+  const p = (h: number, m: number) => pomodoroPhase(workedMs(s, at(h, m).getTime()), cfg);
+  assert.equal(p(10, 50).elapsedInPhase, 20 * MIN);
+  assert.equal(p(10, 54).kind, "work");
+  assert.equal(p(10, 56).kind, "short");
+  const frozen = ok("start: 2026-09-28 10:00\nmode: pomodoro\npause: 10:20");
+  assert.equal(pomodoroPhase(workedMs(frozen, at(10, 45).getTime()), cfg).elapsedInPhase, 20 * MIN);
 });
 
 test("lastOccurrence: today if the time has passed, otherwise yesterday", () => {
@@ -988,6 +1003,7 @@ test("fuzz: random notes never throw, and edits only touch the block body", () =
     "note: hi", "", ">", "> start: 2026-09-28 12:00", "plain text", "start:", "end:", ":", "`inline`",
     "\u00a0start: 10:00", "start: 25:99", "- list item", "\r",
     "pause: 10:20", "resume: 10:30", "pause: 2026-09-28 10:40:00", "resume: 09:00", "pause:", "paused: 5m", "Resume: 10:50",
+    "paused: 1h 2m 3s", "paused: soon", "paused: < 1m", "PAUSED: 45s",
   ];
   const next = rng(42);
   for (let iter = 0; iter < 3000; iter++) {
@@ -1001,15 +1017,9 @@ test("fuzz: random notes never throw, and edits only touch the block body", () =
       if (r.ok) {
         assert.ok(!isNaN(r.session.start.getTime()));
         if (r.session.end) assert.ok(r.session.end >= r.session.start);
-        // pauses alternate and never go back in time; only the last one can be open
-        let prev = r.session.start;
-        r.session.pauses.forEach((p, i) => {
-          assert.ok(p.from >= prev);
-          if (p.to) assert.ok(p.to >= p.from);
-          else assert.equal(i, r.session.pauses.length - 1);
-          prev = p.to ?? p.from;
-        });
-        if (r.session.end) assert.ok(r.session.end >= prev);
+        // an open pause is never before the start, and a finished session has none
+        assert.ok(r.session.pausedMs >= 0);
+        if (r.session.pausedAt) assert.ok(r.session.pausedAt >= r.session.start && !r.session.end);
         const far = r.session.start.getTime() + 1000 * MIN;
         assert.ok(workedMs(r.session, far) >= 0 && pausedMs(r.session, far) >= 0);
       } else {
