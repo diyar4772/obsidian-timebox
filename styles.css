@@ -28,6 +28,19 @@
   border-left-color: var(--text-faint);
 }
 
+/* paused: the accent turns orange ("on hold") and the timer is toned down */
+.timebox-bar.is-paused {
+  --timebox-accent: var(--color-orange);
+}
+
+.timebox-bar.is-paused .timebox-elapsed {
+  color: var(--text-muted);
+}
+
+.timebox-bar.is-paused .timebox-fill {
+  transition: none;
+}
+
 .timebox-row {
   display: flex;
   align-items: center;
@@ -105,7 +118,18 @@
   color: var(--text-muted);
 }
 
-/* ───────────── finish button ───────────── */
+/* ───────────── buttons ───────────── */
+
+.timebox-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--size-4-1);
+  flex-shrink: 0;
+}
+
+.timebox-bar button.timebox-btn.is-icon-only {
+  padding: var(--size-2-1) var(--size-2-3);
+}
 
 .timebox-bar button.timebox-btn {
   display: inline-flex;
@@ -212,6 +236,28 @@
 .timebox-modal-hint {
   margin-top: var(--size-4-2);
   color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.timebox-modal-hint + .timebox-modal-input {
+  margin-top: var(--size-4-2);
+}
+
+.timebox-modal-quick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-1);
+  margin-top: var(--size-4-2);
+}
+
+.timebox-modal-quick button {
+  font-size: var(--font-ui-smaller);
+}
+
+.timebox-modal-error {
+  min-height: 1.5em;
+  margin-top: var(--size-4-2);
+  color: var(--text-error);
   font-size: var(--font-ui-smaller);
 }
 

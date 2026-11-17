@@ -17,7 +17,20 @@ export interface TimeboxSettings {
   sound: boolean;
   systemNotification: boolean;
   statusBar: boolean;
+  /** Remind (or pause/finish) after every this many minutes of work in one session. 0 = off. */
+  remindAfter: number;
+  remindAction: RemindAction;
+  /** Ask about the time away when nothing ran for this many minutes (sleep, Obsidian closed). 0 = off. */
+  awayAfter: number;
 }
+
+export type RemindAction = "notify" | "pause" | "finish";
+
+const REMIND_ACTIONS: Record<RemindAction, string> = {
+  notify: "Remind me",
+  pause: "Pause the session",
+  finish: "Finish the session",
+};
 
 export const DEFAULT_SETTINGS: TimeboxSettings = {
   defaultMode: "simple",
@@ -29,9 +42,23 @@ export const DEFAULT_SETTINGS: TimeboxSettings = {
   sound: true,
   systemNotification: false,
   statusBar: true,
+  remindAfter: 180,
+  remindAction: "notify",
+  awayAfter: 5,
 };
 
 const MAX_MINUTES = 600;
+/** Upper limit of the "0 = off" minute settings (one day). */
+const MAX_GUARD_MINUTES = 1440;
+
+type MinuteKey = "work" | "short" | "long" | "longEvery";
+type GuardKey = "remindAfter" | "awayAfter";
+
+const REMIND_DESC = "After this many minutes of work in one session, do the action below. It repeats at the same interval. 0 turns it off.";
+const REMIND_ACTION_DESC = "What happens when a session reaches the limit above.";
+const AWAY_DESC =
+  "If the computer sleeps or Obsidian is closed for at least this many minutes while a session is running, " +
+  "ask whether that time was a break. 0 turns it off.";
 
 export function pomodoroConfig(s: TimeboxSettings): PomodoroConfig {
   return { work: s.work, short: s.short, long: s.long, longEvery: s.longEvery };
@@ -51,6 +78,11 @@ export function sanitizeSettings(raw: unknown): TimeboxSettings {
     const v = r[k];
     if (typeof v === "number" && Number.isInteger(v) && v >= 1 && v <= MAX_MINUTES) s[k] = v;
   }
+  for (const k of ["remindAfter", "awayAfter"] as const) {
+    const v = r[k];
+    if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= MAX_GUARD_MINUTES) s[k] = v;
+  }
+  if (r.remindAction === "notify" || r.remindAction === "pause" || r.remindAction === "finish") s.remindAction = r.remindAction;
   return s;
 }
 
@@ -70,7 +102,19 @@ export class TimeboxSettingTab extends PluginSettingTab {
   getSettingDefinitions(): SettingDefinitionItem[] {
     const minutes = (value: number) =>
       Number.isInteger(value) && value >= 1 && value <= MAX_MINUTES ? undefined : `Enter a whole number from 1 to ${MAX_MINUTES}.`;
-    const number = (key: "work" | "short" | "long" | "longEvery") => ({
+    const guard = (key: GuardKey) => ({
+      type: "number" as const,
+      key,
+      min: 0,
+      max: MAX_GUARD_MINUTES,
+      step: 1,
+      defaultValue: DEFAULT_SETTINGS[key],
+      validate: (value: number) =>
+        Number.isInteger(value) && value >= 0 && value <= MAX_GUARD_MINUTES
+          ? undefined
+          : `Enter a whole number from 0 to ${MAX_GUARD_MINUTES}.`,
+    });
+    const number = (key: MinuteKey) => ({
       type: "number" as const,
       key,
       min: 1,
@@ -132,6 +176,24 @@ export class TimeboxSettingTab extends PluginSettingTab {
               : "System notifications aren't supported on this device.",
             control: { type: "toggle", key: "systemNotification", disabled: !notificationsSupported() },
           },
+        ],
+      },
+      {
+        type: "group",
+        heading: "Breaks and long sessions",
+        items: [
+          { name: "Long session limit", desc: REMIND_DESC, control: guard("remindAfter") },
+          {
+            name: "At the limit",
+            desc: REMIND_ACTION_DESC,
+            control: {
+              type: "dropdown",
+              key: "remindAction",
+              defaultValue: DEFAULT_SETTINGS.remindAction,
+              options: REMIND_ACTIONS,
+            },
+          },
+          { name: "Ask after being away", desc: AWAY_DESC, control: guard("awayAfter") },
         ],
       },
       {
@@ -246,6 +308,22 @@ export class TimeboxSettingTab extends PluginSettingTab {
         })
     );
 
+    new Setting(containerEl).setName("Breaks and long sessions").setHeading();
+    this.numberSetting("Long session limit", REMIND_DESC, "remindAfter", 0, MAX_GUARD_MINUTES);
+    new Setting(containerEl)
+      .setName("At the limit")
+      .setDesc(REMIND_ACTION_DESC)
+      .addDropdown((d) =>
+        d
+          .addOptions(REMIND_ACTIONS)
+          .setValue(s.remindAction)
+          .onChange(async (v) => {
+            s.remindAction = v === "pause" || v === "finish" ? v : "notify";
+            await this.plugin.saveSettings();
+          })
+      );
+    this.numberSetting("Ask after being away", AWAY_DESC, "awayAfter", 0, MAX_GUARD_MINUTES);
+
     new Setting(containerEl).setName("Appearance").setHeading();
 
     new Setting(containerEl)
@@ -259,25 +337,24 @@ export class TimeboxSettingTab extends PluginSettingTab {
       );
   }
 
-  private numberSetting(name: string, desc: string, key: "work" | "short" | "long" | "longEvery"): void {
-    const s = this.plugin.settings;
+  private numberSetting(name: string, desc: string, key: MinuteKey | GuardKey, min = 1, max = MAX_MINUTES): void {
     new Setting(this.containerEl)
       .setName(name)
       .setDesc(desc)
       .addText((text) => {
         text.inputEl.type = "number";
-        text.inputEl.min = "1";
-        text.inputEl.max = String(MAX_MINUTES);
+        text.inputEl.min = String(min);
+        text.inputEl.max = String(max);
         text.inputEl.addClass("timebox-number-input");
         text
           .setPlaceholder(String(DEFAULT_SETTINGS[key]))
-          .setValue(String(s[key]))
+          .setValue(String(this.plugin.settings[key]))
           .onChange(async (v) => {
             const n = Number(v);
-            const valid = v.trim() !== "" && Number.isInteger(n) && n >= 1 && n <= MAX_MINUTES;
+            const valid = v.trim() !== "" && Number.isInteger(n) && n >= min && n <= max;
             text.inputEl.toggleClass("timebox-invalid", !valid);
             if (!valid) return;
-            s[key] = n;
+            this.plugin.settings[key] = n;
             await this.plugin.saveSettings();
           });
       });

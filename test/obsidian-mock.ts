@@ -39,6 +39,43 @@ export class Modal {
   close(): void {}
 }
 
+export class FuzzySuggestModal<T> extends Modal {
+  static last: FuzzySuggestModal<any> | null = null;
+  setPlaceholder(): void {}
+  getItems(): T[] {
+    return [];
+  }
+  onChooseItem(_item: T): void {}
+  open(): void {
+    FuzzySuggestModal.last = this;
+  }
+}
+
+/** Records its items; tests click them through `Menu.last.items`. */
+export class Menu {
+  static last: Menu | null = null;
+  items: { title: string; icon: string; click: () => void }[] = [];
+  shown = false;
+  addItem(fn: (item: any) => void): this {
+    const rec = { title: "", icon: "", click: () => {} };
+    const item = {
+      setTitle: (t: string) => ((rec.title = t), item),
+      setIcon: (i: string) => ((rec.icon = i), item),
+      onClick: (f: () => void) => ((rec.click = f), item),
+    };
+    fn(item);
+    this.items.push(rec);
+    return this;
+  }
+  addSeparator(): this {
+    return this;
+  }
+  showAtMouseEvent(): void {
+    this.shown = true;
+    Menu.last = this;
+  }
+}
+
 export class PluginSettingTab {
   updates = 0;
   constructor(public app: unknown, public plugin: unknown) {}

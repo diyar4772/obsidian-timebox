@@ -12,9 +12,12 @@ Everything is stored as plain text in the note itself, so your sessions stay rea
 
 - A live session bar inside the note: `18:29 → in progress` with a timer that updates every second (`42:13`, `1:05:09`)
 - One click on **Finish** writes the end time and duration (`1h 18m`) into the block
+- **Pause** for a coffee and **Resume** when you're back: breaks aren't counted, and the bar shows how long you've been away
+- Forgot to stop it? **Finish at an earlier time**, or **add a break** after the fact
+- A reminder (or automatic pause/finish) when a session runs for hours, and a question about the time away after the computer slept
 - Optional **pomodoro mode**: a phase progress bar, `🍅 Pomodoro 2 · Focus · 12:47 left`, green during breaks
 - An on-screen notice, a short beep and (optionally) a system notification when the phase changes
-- The active session in the status bar; click it to open the session's note
+- The active session in the status bar; click it to open the session's note (with several sessions, a menu lists them all)
 - Survives restarts: the pomodoro phase is calculated from the time elapsed since the start, so no timer state is stored
 - You can write or edit blocks by hand; several date formats are supported
 - Works with light and dark mode and community themes, on desktop and mobile
@@ -41,6 +44,13 @@ Everything is stored as plain text in the note itself, so your sessions stay rea
    - If text is selected in the note, it's used as the topic.
    - If you leave it empty, the note name is used.
 4. When you're done, select **Finish** on the bar or run **Finish active session**.
+
+### Breaks
+
+- Select **Pause** on the bar (or run **Pause or resume active session**). The timer stops, the bar turns orange and shows `Paused for 04:13 · Breaks: 16m (2)`. Select **Resume** to carry on.
+- Forgot to pause? Open the **⋯** menu on the bar and choose **Add a break…** (e.g. "the last 15 minutes"), or **Finish at an earlier time…** if you stopped working a while ago.
+- If the computer sleeps or Obsidian is closed while a session runs, you're asked on return whether that time was a break.
+- A session that has been running for 3 hours reminds you. You can change the limit, or have the session paused or finished instead, in the settings.
 
 If the cursor line is empty, the block replaces it; otherwise the block goes on the line below. The cursor then moves below the block so you can keep typing.
 
@@ -70,6 +80,20 @@ duration: 1h 18m
 ```
 ````
 
+A session with breaks looks like this. `duration` is the time you actually worked; `paused` is the total of the breaks:
+
+````markdown
+```timebox
+topic: Math Methods
+start: 2026-09-28 18:29:05
+pause: 2026-09-28 18:50:00
+resume: 2026-09-28 19:02:00
+end: 2026-09-28 19:47:05
+duration: 1h 6m
+paused: 12m
+```
+````
+
 ### Keys
 
 | Key        | Description                                                                         |
@@ -77,8 +101,11 @@ duration: 1h 18m
 | `topic`    | What the session is about. Optional.                                                |
 | `start`    | Start time. **Required.**                                                           |
 | `mode`     | `pomodoro` or `simple`. Defaults to `simple`.                                       |
-| `end`      | End time. Without it, the session is still running.                                |
-| `duration` | For your reference only. It's ignored when reading and recalculated from `end`.     |
+| `pause`    | Start of a break. Can appear several times, each followed by a `resume`.            |
+| `resume`   | End of a break. A `pause` without a `resume` means the session is paused right now. |
+| `end`      | End time. Without it, the session is still running.                                 |
+| `duration` | Time worked (breaks excluded). Ignored when reading and recalculated.               |
+| `paused`   | Total break time. Ignored when reading and recalculated.                            |
 
 - Keys are case-insensitive: `Start`, `START` and `start` all work.
 - Lines the plugin doesn't recognize (e.g. `note: p. 42`) are never touched and stay where they are when the block is updated.
@@ -96,6 +123,7 @@ duration: 1h 18m
 | `HH:mm` or `HH:mm:ss` (time only)            | `18:29`                                   |
 
 - If `start` is only a time, the **note's creation date** is used as the day.
+- `pause`, `resume` and `end` that are only a time follow the line above them: they move to the next day if they'd otherwise be earlier.
 - If `end` is only a time, the start day is used. If that time is earlier than the start, the session crossed midnight and the end moves to the next day. For example, `start: 23:40` and `end: 00:20` is a 40-minute session. The bar shows `(+1)` next to the end time.
 
 When the plugin finishes a session it rewrites the times in full (`2026-09-28 18:29:05`), so the date isn't lost if the note is copied to another device.
@@ -108,7 +136,9 @@ The cycle is: focus, short break, focus, short break… After every 4th focus pe
 - During a break: `☕ Short break · 02:20 left` (the bar turns green)
 - A finished session shows the completed pomodoros: `🍅🍅🍅 3 pomodoros`
 
-The phase is always calculated from the start time, so you see the right phase even after restarting Obsidian or opening the note on another device. As a consequence, if you change the pomodoro durations, the phases of running and finished sessions are recalculated with the new durations.
+Breaks pause the cycle too: the phase is calculated from the time you've worked, so a paused pomodoro picks up exactly where it stopped.
+
+The phase is always calculated from the start time and the breaks, so you see the right phase even after restarting Obsidian or opening the note on another device. As a consequence, if you change the pomodoro durations, the phases of running and finished sessions are recalculated with the new durations.
 
 When the phase changes:
 
@@ -126,6 +156,10 @@ Alerts only work while Obsidian is open.
 | Start pomodoro session              | Starts a session in pomodoro mode.                                         |
 | Start simple session (no pomodoro)  | Starts a session that only tracks time.                                    |
 | Finish active session               | Finishes the active session in the current note, or else the newest one.   |
+| Pause or resume active session      | Pauses the active session, or resumes it if it's paused.                   |
+| Finish active session at an earlier time | Asks when you stopped working and finishes the session at that time.  |
+| Add a break to active session       | Asks how many minutes you were away and counts them as a break.            |
+| Choose a session to finish          | When several sessions are running, pick the one to finish.                 |
 
 You can assign hotkeys to these in **Settings → Hotkeys** (search for "Timebox").
 
@@ -141,12 +175,15 @@ You can assign hotkeys to these in **Settings → Hotkeys** (search for "Timebox
 | Long break interval              | 4       | A long break after this many pomodoros.                              |
 | Sound                            | On      | Beep on phase change.                                                |
 | System notification              | Off     | Operating system notification on phase change.                      |
+| Long session limit               | 180 min | After this much work in one session, do the action below. 0 = off.   |
+| At the limit                     | Remind  | Remind me, pause the session, or finish the session.                 |
+| Ask after being away             | 5 min   | Ask about time away (sleep, Obsidian closed) at least this long. 0 = off. |
 | Status bar                       | On      | Show the active session in the status bar.                           |
 
 ## FAQ
 
 **Where is my data stored?**
-Your sessions live only in your notes, inside the code blocks. The plugin's own `data.json` stores the settings and a list of currently open sessions (note path, start time, topic, mode). That list powers the status bar and the alerts. It's updated when a note is moved or renamed and cleaned up when a note is deleted. Sessions that are no longer in their note, or that were finished by hand, are also removed from it every 30 seconds.
+Your sessions live only in your notes, inside the code blocks. The plugin's own `data.json` stores the settings and a list of currently open sessions (note path, start time, topic, mode, pause state). That list powers the status bar and the alerts. It's updated when a note is moved or renamed and cleaned up when a note is deleted. Sessions that are no longer in their note, or that were finished by hand, are also removed from it every 30 seconds.
 
 **Can I edit a block by hand?**
 Yes. You can change the start, end or topic, and add your own lines inside the block. An open session you write by hand is picked up as an active session when the note is displayed.
@@ -182,6 +219,7 @@ Project layout:
 | `src/settings.ts`        | Settings and the settings tab.                                                        |
 | `src/ui/session-bar.ts`  | The session bar rendered inside notes.                                                |
 | `src/ui/topic-modal.ts`  | The dialog that asks for the topic.                                                   |
+| `src/ui/modals.ts`       | The "finish at", "add a break", "were you away?" dialogs and the session picker.      |
 | `src/ui/alerts.ts`       | Notices, the beep and system notifications.                                           |
 | `test/core.test.ts`      | Unit tests.                                                                           |
 

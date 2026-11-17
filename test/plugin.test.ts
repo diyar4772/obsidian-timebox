@@ -3,7 +3,9 @@
 // editor and through vault.process, the active list, rename/delete, and cleanup.
 
 import * as assert from "assert";
-import { Editor, MarkdownView, Notice, TFile } from "obsidian";
+import { Editor, FuzzySuggestModal, MarkdownView, Menu, Notice, TFile } from "obsidian";
+import { formatStamp } from "../src/core";
+import { AwayModal, BreakModal, FinishAtModal } from "../src/ui/modals";
 import TimeboxPlugin from "../src/main";
 import { TopicModal } from "../src/ui/topic-modal";
 import { DEFAULT_SETTINGS, TimeboxSettingTab } from "../src/settings";
@@ -17,6 +19,23 @@ let modalInitial = "";
   modalInitial = this.initial;
   return modalAnswer;
 };
+
+// The pause dialogs answer the same way.
+let finishAtAnswer: Date | null = null;
+let breakAnswer: number | null = null;
+let awayAnswer: "break" | "keep" | null = null;
+let awayAsked: { from: Date; to: Date; topics: string[] }[] = [];
+(FinishAtModal.prototype as any).ask = async () => finishAtAnswer;
+(BreakModal.prototype as any).ask = async () => breakAnswer;
+(AwayModal.prototype as any).ask = async function (this: any) {
+  awayAsked.push({ from: this.from, to: this.to, topics: this.topics });
+  return awayAnswer;
+};
+
+const MINUTE = 60_000;
+/** A stamp `minutes` before now (the pause features work with the real clock). */
+const ago = (minutes: number) => formatStamp(new Date(Math.floor(Date.now() / 1000) * 1000 - minutes * MINUTE));
+const at = (stamp: string) => new Date(stamp.replace(" ", "T")).getTime();
 
 const STAMP = /\d{4}-\d\d-\d\d \d\d:\d\d:\d\d/;
 
@@ -394,6 +413,341 @@ test("declarative settings: every setting is defined, and saving keeps the activ
   assert.equal(work.validate(25), undefined);
   assert.match(work.validate(2.5), /whole number/);
   assert.match(work.validate(601), /whole number/);
+});
+
+// ─────────────── pausing ───────────────
+
+test("pause and resume through the editor: lines are written and the active entry follows", async () => {
+  const start = ago(30);
+  const { plugin, views } = await setup({ "A.md": "# A\n```timebox\ntopic: T\nstart: " + start + "\nnote: keep\n```\nafter" }, ["A.md"]);
+  const ref = { path: "A.md", start };
+  const ed = views[0].editor;
+  ed.cursor = { line: 6, ch: 2 };
+
+  assert.equal(await plugin.pauseSession(ref), true);
+  assert.match(ed.getValue(), new RegExp("start: " + start + "\npause: " + STAMP.source + "\nnote: keep\n```\nafter$"));
+  assert.deepEqual(ed.cursor, { line: 7, ch: 2 }, "the cursor moves down with the text");
+  assert.equal(plugin.active.length, 1, "pausing tracks an untracked block");
+  assert.match(plugin.active[0].pausedAt, STAMP);
+  assert.equal(plugin.data.active[0].pausedAt, plugin.active[0].pausedAt, "the pause state is persisted");
+
+  const paused = ed.getValue();
+  await plugin.pauseSession(ref);
+  assert.equal(ed.getValue(), paused, "pausing twice changes nothing");
+
+  assert.equal(await plugin.resumeSession(ref), true);
+  assert.match(ed.getValue(), new RegExp("pause: " + STAMP.source + "\nresume: " + STAMP.source + "\nnote: keep"));
+  assert.equal(plugin.active[0].pausedAt, null);
+  const resumed = ed.getValue();
+  await plugin.resumeSession(ref);
+  assert.equal(ed.getValue(), resumed, "resuming twice changes nothing");
+});
+
+test("pausing a closed note and a note in reading view goes through vault.process", async () => {
+  const start = ago(10);
+  const note = "```timebox\nstart: " + start + "\n```";
+  const { plugin, disk, views } = await setup({ "C.md": note, "R.md": note }, ["R.md"], "preview");
+  for (const path of ["C.md", "R.md"]) {
+    assert.equal(await plugin.pauseSession({ path, start }), true);
+    assert.match(disk[path], new RegExp("^```timebox\nstart: " + start + "\npause: " + STAMP.source + "\n```$"));
+  }
+  assert.equal(views[0].editor.getValue(), note, "the hidden editor isn't touched");
+  assert.equal(plugin.active.length, 2);
+});
+
+test("finishing a paused session ends it where the break began", async () => {
+  const start = ago(60);
+  const pause = ago(20);
+  const { plugin, disk } = await setup({ "A.md": "```timebox\nstart: " + start + "\npause: " + pause + "\n```" });
+  assert.equal(await plugin.stopSession({ path: "A.md", start }), true);
+  assert.equal(disk["A.md"], "```timebox\nstart: " + start + "\nend: " + pause + "\nduration: 40m\n```");
+});
+
+test("a finished session is never paused; a missing block is reported and dropped", async () => {
+  const done = "```timebox\nstart: 2026-09-28 10:00:00\nend: 2026-09-28 11:00:00\nduration: 1h\n```";
+  const { plugin, disk } = await setup({ "A.md": done, "B.md": "nothing here" });
+  plugin.active.push({ path: "A.md", start: "2026-09-28 10:00:00", topic: "", mode: "simple" });
+  plugin.active.push({ path: "B.md", start: "2026-09-28 10:00:00", topic: "", mode: "simple" });
+  await plugin.pauseSession({ path: "A.md", start: "2026-09-28 10:00:00" });
+  assert.equal(disk["A.md"], done);
+  Notice.log.length = 0;
+  assert.equal(await plugin.pauseSession({ path: "B.md", start: "2026-09-28 10:00:00" }), false);
+  assert.match(Notice.log[0], /block was not found/);
+  assert.equal(plugin.active.length, 0, "finished and missing sessions leave the active list");
+});
+
+test("pause command toggles the preferred session and is hidden when nothing is active", async () => {
+  const start = ago(5);
+  const { plugin, views } = await setup({ "A.md": "```timebox\nstart: " + start + "\n```" }, ["A.md"]);
+  const cmd = plugin.commands.find((c: any) => c.id === "pause-resume-active-session");
+  assert.equal(cmd.checkCallback(true), false);
+  plugin.active.push({ path: "A.md", start, topic: "", mode: "simple" });
+  assert.equal(cmd.checkCallback(true), true);
+  cmd.checkCallback(false);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.match(views[0].editor.getValue(), /\npause: /);
+  cmd.checkCallback(false);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.match(views[0].editor.getValue(), /\nresume: /);
+});
+
+test("status bar: a paused session shows ⏸ and a frozen time; a running one is preferred", async () => {
+  const { plugin, renderBlock } = await setup({ "A.md": "", "B.md": "" });
+  renderBlock("A.md", "topic: Paused\nstart: " + ago(60) + "\npause: " + ago(50) + "\nresume: " + ago(40) + "\npause: " + ago(10));
+  assert.equal(plugin.statusEl.text, "⏸ 40:00 · Paused");
+  assert.equal(plugin.active[0].pausedMs, 10 * MINUTE);
+  renderBlock("B.md", "topic: Running\nstart: " + ago(90) + "\npause: " + ago(80) + "\nresume: " + ago(20));
+  assert.match(plugin.statusEl.text, /^⏱ 30:0\d · Running \(\+1\)$/);
+  // pomodoro: the phase stands still while paused (25 min focus, 20 worked → 05:00 left)
+  const { plugin: p2, renderBlock: r2 } = await setup({ "A.md": "" });
+  r2("A.md", "topic: P\nmode: pomodoro\nstart: " + ago(60) + "\npause: " + ago(40));
+  assert.equal(p2.statusEl.text, "⏸ Focus 05:00 · P");
+});
+
+test("cleanup picks up a pause typed by hand in a note that isn't rendered", async () => {
+  const start = ago(30);
+  const { plugin, disk } = await setup({ "A.md": "```timebox\nstart: " + start + "\n```" });
+  plugin.active.push({ path: "A.md", start, topic: "", mode: "simple" });
+  disk["A.md"] = "```timebox\ntopic: New\nstart: " + start + "\npause: " + ago(10) + "\n```";
+  await plugin.pruneActive();
+  assert.equal(plugin.active[0].pausedAt, ago(10));
+  assert.equal(plugin.active[0].topic, "New");
+  assert.equal(plugin.data.active[0].pausedAt, ago(10));
+});
+
+test("finish at an earlier time: the chosen end is written and later breaks are dropped", async () => {
+  const start = ago(120);
+  const body = "```timebox\nstart: " + start + "\npause: " + ago(100) + "\nresume: " + ago(90) + "\npause: " + ago(30) + "\nresume: " + ago(20) + "\n```";
+  const { plugin, disk } = await setup({ "A.md": body });
+  plugin.active.push({ path: "A.md", start, topic: "T", mode: "simple" });
+  finishAtAnswer = null;
+  await plugin.promptFinishAt({ path: "A.md", start });
+  assert.equal(disk["A.md"], body, "cancelling changes nothing");
+  finishAtAnswer = new Date(at(ago(60)));
+  await plugin.promptFinishAt({ path: "A.md", start });
+  assert.equal(
+    disk["A.md"],
+    "```timebox\nstart: " + start + "\npause: " + ago(100) + "\nresume: " + ago(90) + "\nend: " + ago(60) + "\nduration: 50m\npaused: 10m\n```"
+  );
+  assert.equal(plugin.active.length, 0);
+});
+
+test("add a break: the last N minutes become a pause/resume pair and the session keeps running", async () => {
+  const start = ago(45);
+  const { plugin, views } = await setup({ "A.md": "```timebox\nstart: " + start + "\n```" }, ["A.md"]);
+  breakAnswer = null;
+  await plugin.promptBreak({ path: "A.md", start });
+  assert.ok(!views[0].editor.getValue().includes("pause"));
+  breakAnswer = 15;
+  await plugin.promptBreak({ path: "A.md", start });
+  const m = views[0].editor.getValue().match(/\npause: (.+)\nresume: (.+)\n```$/);
+  assert.ok(m, "a closed break was written");
+  assert.equal(at(m![2]) - at(m![1]), 15 * MINUTE);
+  assert.equal(plugin.active[0].pausedAt, null);
+  assert.equal(plugin.active[0].pausedMs, 15 * MINUTE);
+  // longer than the session: clipped to its start
+  breakAnswer = 600;
+  await plugin.promptBreak({ path: "A.md", start });
+  assert.match(views[0].editor.getValue(), new RegExp("start: " + start + "\npause: " + start + "\nresume: "));
+  assert.equal((views[0].editor.getValue().match(/pause:/g) ?? []).length, 1, "overlapping breaks are merged");
+});
+
+test("away: after a long gap between ticks, running sessions can count it as a break", async () => {
+  const start = ago(60);
+  const pausedBody = "```timebox\nstart: " + start + "\npause: " + ago(50) + "\n```";
+  const { plugin, disk, renderBlock } = await setup({ "A.md": "```timebox\ntopic: Run\nstart: " + start + "\n```", "P.md": pausedBody });
+  renderBlock("A.md", "topic: Run\nstart: " + start);
+  renderBlock("P.md", "start: " + start + "\npause: " + ago(50));
+  const flush = () => new Promise((r) => setTimeout(r, 5));
+
+  // a short gap: nothing is asked
+  awayAsked = [];
+  plugin.lastTick = Date.now() - 2 * MINUTE;
+  plugin.tick();
+  await flush();
+  assert.equal(awayAsked.length, 0);
+
+  awayAnswer = "keep";
+  plugin.lastTick = Date.now() - 42 * MINUTE;
+  plugin.tick();
+  await flush();
+  assert.equal(awayAsked.length, 1);
+  assert.deepEqual(awayAsked[0].topics, ["Run"], "paused sessions aren't asked about");
+  assert.ok(Math.abs(awayAsked[0].to.getTime() - awayAsked[0].from.getTime() - 42 * MINUTE) < 2000);
+  assert.ok(!disk["A.md"].includes("pause"), "keeping the time changes nothing");
+
+  awayAnswer = "break";
+  plugin.lastTick = Date.now() - 42 * MINUTE;
+  plugin.tick();
+  await flush();
+  const m = disk["A.md"].match(/\npause: (.+)\nresume: (.+)\n```$/);
+  assert.ok(m, "the gap was written as a break");
+  assert.ok(Math.abs(at(m![2]) - at(m![1]) - 42 * MINUTE) <= 1000);
+  assert.equal(disk["P.md"], pausedBody, "the paused session is left alone");
+
+  // switched off
+  plugin.settings.awayAfter = 0;
+  awayAsked = [];
+  plugin.lastTick = Date.now() - 500 * MINUTE;
+  plugin.tick();
+  await flush();
+  assert.equal(awayAsked.length, 0);
+});
+
+test("away on startup: the time Obsidian was closed is offered, clipped to the session's start", async () => {
+  const start = ago(30);
+  const { plugin, app, disk } = await setup({ "A.md": "```timebox\nstart: " + start + "\n```" });
+  plugin.active.push({ path: "A.md", start, topic: "T", mode: "simple" });
+  const store: Record<string, unknown> = {};
+  awayAsked = [];
+  awayAnswer = "break";
+
+  // Obsidian older than 1.8.7 has no local storage API: the feature is skipped
+  await plugin.checkAwayOnStartup();
+  assert.equal(awayAsked.length, 0);
+
+  app.loadLocalStorage = (k: string) => store[k] ?? null;
+  app.saveLocalStorage = (k: string, v: unknown) => (store[k] = v);
+  await plugin.checkAwayOnStartup();
+  assert.equal(awayAsked.length, 0, "nothing stored yet");
+  assert.ok(Number(store["timebox-last-seen"]) > 0, "the visit is recorded");
+
+  store["timebox-last-seen"] = String(Date.now() - 20 * MINUTE);
+  await plugin.checkAwayOnStartup();
+  assert.equal(awayAsked.length, 1);
+  assert.match(disk["A.md"], /\npause: .+\nresume: .+\n```$/);
+
+  // closed since before the session existed (e.g. started on another device): from its start
+  disk["A.md"] = "```timebox\nstart: " + start + "\n```";
+  await plugin.pruneActive();
+  store["timebox-last-seen"] = String(Date.now() - 500 * MINUTE);
+  await plugin.checkAwayOnStartup();
+  assert.equal(formatStamp(awayAsked[1].from), start);
+  assert.match(disk["A.md"], new RegExp("\npause: " + start + "\nresume: "));
+});
+
+test("long session limit: quiet when first seen, then reminds, pauses or finishes", async () => {
+  const realNow = Date.now;
+  try {
+    for (const action of ["notify", "pause", "finish"] as const) {
+      const start = ago(170);
+      const { plugin, disk } = await setup({ "A.md": "```timebox\ntopic: Long\nstart: " + start + "\n```" });
+      const alerts: string[] = [];
+      plugin.alerts.notify = (title: string, body: string) => alerts.push(`${title} | ${body}`);
+      plugin.settings.remindAction = action;
+      plugin.active.push({ path: "A.md", start, topic: "Long", mode: "simple" });
+
+      plugin.tick();
+      assert.equal(alerts.length, 0);
+      // 11 minutes later the session passes 180 minutes
+      Date.now = () => realNow() + 11 * MINUTE;
+      plugin.lastTick = Date.now();
+      plugin.tick();
+      await new Promise((r) => setTimeout(r, 5));
+      assert.equal(alerts.length, 1, action);
+      plugin.tick();
+      await new Promise((r) => setTimeout(r, 5));
+      assert.equal(alerts.length, 1, "only once per limit");
+      Date.now = realNow;
+
+      if (action === "notify") {
+        assert.match(alerts[0], /⏰ Long \| Running for 3h/);
+        assert.ok(!disk["A.md"].includes("pause") && !disk["A.md"].includes("end"));
+      } else if (action === "pause") {
+        assert.match(alerts[0], /⏸ Long \| Paused after 3h/);
+        assert.match(disk["A.md"], /\npause: /);
+        assert.match(plugin.active[0].pausedAt, STAMP);
+      } else {
+        assert.match(alerts[0], /⏹ Long \| Finished after 3h/);
+        assert.match(disk["A.md"], /\nend: .+\nduration: 2h 50m\n```$/);
+        assert.equal(plugin.active.length, 0);
+      }
+    }
+
+    // off, and never for paused sessions
+    const start = ago(170);
+    const { plugin } = await setup({ "A.md": "" });
+    const alerts: string[] = [];
+    plugin.alerts.notify = (title: string) => alerts.push(title);
+    plugin.active.push({ path: "A.md", start, topic: "Off", mode: "simple" });
+    plugin.active.push({ path: "A.md", start: ago(169), topic: "Paused", mode: "simple", pausedAt: ago(1), pausedMs: 0 });
+    plugin.settings.remindAfter = 0;
+    plugin.tick();
+    Date.now = () => realNow() + 11 * MINUTE;
+    plugin.lastTick = Date.now();
+    plugin.tick();
+    assert.equal(alerts.length, 0);
+    plugin.settings.remindAfter = 180;
+    plugin.tick();
+    Date.now = () => realNow() + 400 * MINUTE;
+    plugin.lastTick = Date.now();
+    plugin.tick();
+    assert.deepEqual(alerts, ["⏰ Off"]);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test("several sessions: the status bar opens a menu, and finishing asks which one", async () => {
+  const { plugin, disk, app } = await setup({
+    "A.md": "```timebox\ntopic: One\nstart: " + ago(20) + "\n```",
+    "B.md": "```timebox\ntopic: Two\nstart: " + ago(10) + "\npause: " + ago(5) + "\n```",
+  });
+  plugin.active.push({ path: "A.md", start: ago(20), topic: "One", mode: "simple" });
+  await plugin.pruneActive();
+  const opened: string[] = [];
+  app.workspace.getLeaf = () => ({ openFile: async (f: TFile) => void opened.push(f.path) });
+  Menu.last = null;
+  plugin.onStatusClick({});
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(Menu.last, null, "a single session opens its note instead of a menu");
+  assert.deepEqual(opened, ["A.md"]);
+
+  plugin.active.push({ path: "B.md", start: ago(10), topic: "Two", mode: "simple" });
+  await plugin.pruneActive();
+  plugin.onStatusClick({});
+  const menu = Menu.last!;
+  assert.deepEqual(menu.items.map((i) => i.icon), ["pause", "timer", "square"]);
+  assert.match(menu.items[0].title, /^⏸ 05:00 · Two$/);
+  assert.match(menu.items[1].title, /^⏱ 20:0\d · One$/);
+  menu.items[0].click();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(opened, ["A.md", "B.md"]);
+
+  const cmd = plugin.commands.find((c: any) => c.id === "choose-session-to-finish");
+  assert.equal(cmd.checkCallback(true), true);
+  cmd.checkCallback(false);
+  const picker: any = FuzzySuggestModal.last;
+  assert.deepEqual(picker.getItems().map((a: any) => a.topic), ["Two", "One"]);
+  assert.equal(picker.getItemText(picker.getItems()[1]), "One · A");
+  picker.onChooseItem(picker.getItems()[1]);
+  await new Promise((r) => setTimeout(r, 5));
+  assert.match(disk["A.md"], /\nend: /);
+  assert.ok(!disk["B.md"].includes("end:"));
+  assert.deepEqual(plugin.active.map((a: any) => a.topic), ["Two"]);
+});
+
+test("data.json from 1.0.x loads; broken pause fields are dropped; new settings are validated", async () => {
+  const { plugin } = await setup({});
+  plugin.data = {
+    settings: { remindAfter: -1, awayAfter: 2000, remindAction: "explode" },
+    active: [
+      { path: "A.md", start: "2026-09-28 10:00:00", topic: "old", mode: "simple" },
+      { path: "B.md", start: "2026-09-28 10:00:00", topic: "ok", mode: "simple", pausedMs: 60000, pausedAt: "2026-09-28 10:30:00" },
+      { path: "C.md", start: "2026-09-28 10:00:00", topic: "bad", mode: "simple", pausedAt: "soon" },
+      { path: "D.md", start: "2026-09-28 10:00:00", topic: "bad", mode: "simple", pausedMs: -5 },
+    ],
+  };
+  await plugin.loadState();
+  assert.deepEqual(plugin.active.map((a: any) => a.topic), ["old", "ok"]);
+  assert.equal(plugin.settings.remindAfter, 180);
+  assert.equal(plugin.settings.awayAfter, 5);
+  assert.equal(plugin.settings.remindAction, "notify");
+  plugin.data = { settings: { remindAfter: 0, awayAfter: 0, remindAction: "pause" }, active: [] };
+  await plugin.loadState();
+  assert.equal(plugin.settings.remindAfter, 0);
+  assert.equal(plugin.settings.awayAfter, 0);
+  assert.equal(plugin.settings.remindAction, "pause");
 });
 
 (async () => {

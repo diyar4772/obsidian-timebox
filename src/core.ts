@@ -8,11 +8,19 @@ export const BLOCK_LANG = "timebox";
 
 export type SessionMode = "simple" | "pomodoro";
 
+/** A break taken during a session. `to` is null while the session is still paused. */
+export interface Pause {
+  from: Date;
+  to: Date | null;
+}
+
 export interface Session {
   topic: string;
   start: Date;
   end: Date | null;
   mode: SessionMode;
+  /** Breaks in chronological order ("pause:" / "resume:" lines). Only the last one can be open. */
+  pauses: Pause[];
   /** Unrecognized lines (e.g. "note: p. 42"), in order. Never deleted. */
   extra: string[];
 }
@@ -132,9 +140,9 @@ export function parseStamp(raw: string, dayOf?: Date): Date | null {
 
 // ───────────────────────── block parsing ─────────────────────────
 
-type Field = "topic" | "start" | "end" | "mode" | "duration";
+type Field = "topic" | "start" | "end" | "mode" | "duration" | "pause" | "resume" | "paused";
 
-const FIELDS: readonly Field[] = ["topic", "start", "end", "mode", "duration"];
+const FIELDS: readonly Field[] = ["topic", "start", "end", "mode", "duration", "pause", "resume", "paused"];
 
 /** If the line starts with a known key (case-insensitive), returns the field and its value. */
 function fieldOf(line: string): { field: Field; value: string } | null {
@@ -154,6 +162,23 @@ export type ParseResult = { ok: true; session: Session } | { ok: false; error: s
 const FORMAT_HINT = "Expected YYYY-MM-DD HH:mm, DD.MM.YYYY HH:mm or HH:mm.";
 
 /**
+ * Reads a time that can't be earlier than `prev`. A bare time is read on prev's day, or on the
+ * next calendar day if that would be earlier (midnight was crossed). Re-reading it on the next
+ * day, instead of adding 24 h, keeps the wall-clock time on DST nights.
+ */
+function parseNotBefore(raw: string, prev: Date): { at: Date } | { error: "format" | "order" } {
+  let at = parseStamp(raw, prev);
+  if (!at) return { error: "format" };
+  if (at < prev && isTimeOnly(raw)) {
+    const nextDay = new Date(prev.getTime());
+    nextDay.setDate(nextDay.getDate() + 1);
+    at = parseStamp(raw, nextDay);
+  }
+  if (!at || at < prev) return { error: "order" };
+  return { at };
+}
+
+/**
  * Parses the contents of a `timebox` block.
  * @param dayOf Day to use when the start is a bare time (the note's creation date).
  */
@@ -163,6 +188,7 @@ export function parseBlock(source: string, dayOf?: Date): ParseResult {
   let endRaw: string | null = null;
   let mode: SessionMode = "simple";
   const extra: string[] = [];
+  const events: { kind: "pause" | "resume"; raw: string }[] = [];
 
   for (const line of source.split(/\r?\n/)) {
     const f = fieldOf(line);
@@ -183,8 +209,13 @@ export function parseBlock(source: string, dayOf?: Date): ParseResult {
       case "mode":
         mode = parseMode(f.value);
         break;
+      case "pause":
+      case "resume":
+        events.push({ kind: f.field, raw: f.value });
+        break;
       case "duration":
-        break; // ignored: always recomputed from the end time
+      case "paused":
+        break; // ignored: always recomputed from the other lines
     }
   }
 
@@ -194,50 +225,181 @@ export function parseBlock(source: string, dayOf?: Date): ParseResult {
   const start = parseStamp(startRaw, dayOf);
   if (!start) return { ok: false, error: `Can't read the start time “${startRaw}”. ${FORMAT_HINT}` };
 
-  let end: Date | null = null;
-  if (endRaw !== null && endRaw !== "") {
-    end = parseStamp(endRaw, start);
-    if (!end) return { ok: false, error: `Can't read the end time “${endRaw}”. ${FORMAT_HINT}` };
-    if (end < start) {
-      // A bare time earlier than the start means midnight was crossed: move it to the next day.
-      // Re-read the time on the next calendar day (adding 24 h would be off by an hour on DST nights).
-      if (isTimeOnly(endRaw)) {
-        const nextDay = new Date(start.getTime());
-        nextDay.setDate(nextDay.getDate() + 1);
-        end = parseStamp(endRaw, nextDay);
-      }
-      if (!end || end < start) return { ok: false, error: "The end time can't be before the start time." };
+  // Pauses and resumes must alternate and move forward in time.
+  const pauses: Pause[] = [];
+  let last = start;
+  for (const e of events) {
+    const open = pauses.length > 0 && pauses[pauses.length - 1].to === null;
+    if (e.kind === "pause" && open) {
+      return { ok: false, error: "Two “pause:” lines in a row. Add a “resume:” line between them." };
     }
+    if (e.kind === "resume" && !open) {
+      return { ok: false, error: "A “resume:” line needs a “pause:” line before it." };
+    }
+    const r = parseNotBefore(e.raw, last);
+    if ("error" in r) {
+      return {
+        ok: false,
+        error:
+          r.error === "format"
+            ? `Can't read the ${e.kind} time “${e.raw}”. ${FORMAT_HINT}`
+            : `The ${e.kind} time “${e.raw}” is before the line above it.`,
+      };
+    }
+    if (e.kind === "pause") pauses.push({ from: r.at, to: null });
+    else pauses[pauses.length - 1].to = r.at;
+    last = r.at;
   }
 
-  return { ok: true, session: { topic, start, end, mode, extra } };
+  let end: Date | null = null;
+  if (endRaw !== null && endRaw !== "") {
+    const r = parseNotBefore(endRaw, last);
+    if ("error" in r) {
+      if (r.error === "format") return { ok: false, error: `Can't read the end time “${endRaw}”. ${FORMAT_HINT}` };
+      return {
+        ok: false,
+        error: pauses.length > 0 ? "The end time can't be before the last pause or resume." : "The end time can't be before the start time.",
+      };
+    }
+    end = r.at;
+  }
+
+  return { ok: true, session: { topic, start, end, mode, pauses, extra } };
+}
+
+// ───────────────────────── pauses ─────────────────────────
+
+/** The break the session is in right now, or null if it's running or finished. */
+export function openPause(s: Session): Pause | null {
+  const last = s.pauses[s.pauses.length - 1];
+  return !s.end && last && last.to === null ? last : null;
+}
+
+/** Total break time up to `now` (up to the end for a finished session), in ms. */
+export function pausedMs(s: Session, now: number): number {
+  const limit = s.end ? s.end.getTime() : now;
+  let total = 0;
+  for (const p of s.pauses) {
+    const to = Math.min(p.to ? p.to.getTime() : limit, limit);
+    total += Math.max(0, to - p.from.getTime());
+  }
+  return total;
+}
+
+/** Time actually worked up to `now` (up to the end for a finished session): elapsed minus breaks. */
+export function workedMs(s: Session, now: number): number {
+  const limit = s.end ? s.end.getTime() : now;
+  return Math.max(0, limit - s.start.getTime() - pausedMs(s, now));
+}
+
+const laterOf = (a: Date, b: Date) => (a.getTime() >= b.getTime() ? a : b);
+
+/** The latest time written in the session (start, last pause or resume). New events can't precede it. */
+function lastEvent(s: Session): Date {
+  const p = s.pauses[s.pauses.length - 1];
+  return p ? p.to ?? p.from : s.start;
+}
+
+/** Starts a break at `at`. Finished and already paused sessions are returned as they are. */
+export function pauseAt(s: Session, at: Date): Session {
+  if (s.end || openPause(s)) return s;
+  return { ...s, pauses: [...s.pauses, { from: laterOf(at, lastEvent(s)), to: null }] };
+}
+
+/** Ends the current break at `at`. Sessions that aren't paused are returned as they are. */
+export function resumeAt(s: Session, at: Date): Session {
+  const open = openPause(s);
+  if (!open) return s;
+  return { ...s, pauses: [...s.pauses.slice(0, -1), { from: open.from, to: laterOf(at, open.from) }] };
+}
+
+/**
+ * Finishes the session at `end` (which may be in the past: "I actually stopped at 17:40").
+ * Breaks that start at or after the end are dropped. If the end falls inside a break, or the
+ * session is still paused, the session ends where that break began: nobody was working after it.
+ */
+export function finishAt(s: Session, end: Date): Session {
+  let e = laterOf(end, s.start);
+  const pauses: Pause[] = [];
+  for (const p of s.pauses) {
+    if (p.from.getTime() >= e.getTime()) break;
+    if (p.to === null || p.to.getTime() > e.getTime()) {
+      e = p.from;
+      break;
+    }
+    pauses.push(p);
+  }
+  return { ...s, end: e, pauses };
+}
+
+/**
+ * Adds a break from `from` to `to` after the fact ("I was away for the last 15 minutes").
+ * It is clipped to the session and merged with any breaks it touches; if it reaches a break
+ * that is still open, the session stays paused.
+ */
+export function addBreak(s: Session, from: Date, to: Date): Session {
+  const lo = laterOf(from, s.start).getTime();
+  const hi = s.end ? Math.min(to.getTime(), s.end.getTime()) : to.getTime();
+  if (!(hi > lo)) return s;
+  const OPEN = Number.POSITIVE_INFINITY;
+  const spans = s.pauses.map((p) => [p.from.getTime(), p.to ? p.to.getTime() : OPEN] as [number, number]);
+  spans.push([lo, hi]);
+  spans.sort((a, b) => a[0] - b[0]);
+  const merged: [number, number][] = [];
+  for (const span of spans) {
+    const prev = merged[merged.length - 1];
+    if (prev && span[0] <= prev[1]) prev[1] = Math.max(prev[1], span[1]);
+    else merged.push([span[0], span[1]]);
+  }
+  return { ...s, pauses: merged.map(([a, b]) => ({ from: new Date(a), to: b === OPEN ? null : new Date(b) })) };
+}
+
+/**
+ * The most recent moment the clock showed `hours:minutes`, at or before `now`
+ * (today, or yesterday if that time hasn't come yet today). Returns null for an invalid time.
+ */
+export function lastOccurrence(hours: number, minutes: number, now: Date): Date | null {
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return null;
+  const today = makeDate(now.getFullYear(), now.getMonth() + 1, now.getDate(), hours, minutes, 0);
+  if (!today || hours < 0 || minutes < 0) return null;
+  if (today.getTime() <= now.getTime()) return today;
+  const day = new Date(now.getTime());
+  day.setDate(day.getDate() - 1);
+  return makeDate(day.getFullYear(), day.getMonth() + 1, day.getDate(), hours, minutes, 0);
 }
 
 // ───────────────────────── block writing ─────────────────────────
 
-/** Canonical lines of a session (field → line). Absent fields are omitted. */
-function canonicalLines(s: Session): Partial<Record<Field, string>> {
-  const out: Partial<Record<Field, string>> = {
-    topic: `topic: ${s.topic}`,
-    start: `start: ${formatStamp(s.start)}`,
+/**
+ * Canonical lines of a session (field → lines). Absent fields are omitted.
+ * All pause and resume lines live under "pause", in order, so they are written as one group.
+ */
+function canonicalLines(s: Session): Partial<Record<Field, string[]>> {
+  const out: Partial<Record<Field, string[]>> = {
+    start: [`start: ${formatStamp(s.start)}`],
   };
-  if (s.mode === "pomodoro") out.mode = "mode: pomodoro";
+  if (s.topic !== "") out.topic = [`topic: ${s.topic}`];
+  if (s.mode === "pomodoro") out.mode = ["mode: pomodoro"];
+  if (s.pauses.length > 0) {
+    out.pause = s.pauses.flatMap((p) =>
+      p.to ? [`pause: ${formatStamp(p.from)}`, `resume: ${formatStamp(p.to)}`] : [`pause: ${formatStamp(p.from)}`]
+    );
+  }
   if (s.end) {
-    out.end = `end: ${formatStamp(s.end)}`;
-    out.duration = `duration: ${formatDuration(s.end.getTime() - s.start.getTime())}`;
+    const end = s.end.getTime();
+    out.end = [`end: ${formatStamp(s.end)}`];
+    out.duration = [`duration: ${formatDuration(workedMs(s, end))}`];
+    if (s.pauses.length > 0) out.paused = [`paused: ${formatDuration(pausedMs(s, end))}`];
   }
   return out;
 }
 
-const FIELD_ORDER: Field[] = ["topic", "start", "mode", "end", "duration"];
+const FIELD_ORDER: Field[] = ["topic", "start", "mode", "pause", "end", "duration", "paused"];
 
 /** Builds new block contents (without fences). An empty topic produces no "topic:" line. */
 export function serializeBlock(s: Session): string {
   const c = canonicalLines(s);
-  const lines = FIELD_ORDER.filter((f) => f !== "topic" || s.topic !== "")
-    .map((f) => c[f])
-    .filter((l): l is string => l !== undefined);
-  return [...lines, ...s.extra].join("\n");
+  return [...FIELD_ORDER.flatMap((f) => c[f] ?? []), ...s.extra].join("\n");
 }
 
 /** Builds a complete block including fences. */
@@ -249,8 +411,9 @@ export function buildBlock(s: Session): string {
  * Rewrites an existing block body with new session data.
  * - Unrecognized lines and blank lines stay where they are.
  * - Known lines are replaced with their canonical form (duplicates collapse to one).
+ * - Pause and resume lines are rewritten as one group, where the first of them was.
  * - Missing fields are inserted after the last field that precedes them in canonical order.
- * - `duration` is always written directly below `end`.
+ * - `duration` is always written directly below `end`, and `paused` below `duration`.
  */
 export function rewriteBody(bodyLines: string[], s: Session): string[] {
   const canon = canonicalLines(s);
@@ -263,18 +426,16 @@ export function rewriteBody(bodyLines: string[], s: Session): string[] {
       out.push({ line });
       continue;
     }
-    if (f.field === "duration" || emitted.has(f.field)) continue;
-    const c = canon[f.field];
-    if (c === undefined) continue; // e.g. a stale "mode:" line on a simple session
-    out.push({ line: c, field: f.field });
-    emitted.add(f.field);
+    const field = f.field === "resume" ? "pause" : f.field;
+    if (field === "duration" || field === "paused" || emitted.has(field)) continue;
+    emitted.add(field); // also when it has no canonical form, e.g. a stale "mode:" line on a simple session
+    for (const c of canon[field] ?? []) out.push({ line: c, field });
   }
 
   const order = (f: Field) => FIELD_ORDER.indexOf(f);
   for (const f of FIELD_ORDER) {
     const c = canon[f];
     if (c === undefined || emitted.has(f)) continue;
-    if (f === "topic" && s.topic === "") continue;
     // insert after the last field that comes before this one in canonical order
     let at = -1;
     for (let i = 0; i < out.length; i++) {
@@ -286,16 +447,18 @@ export function rewriteBody(bodyLines: string[], s: Session): string[] {
       const first = out.findIndex((o) => o.field !== undefined);
       at = first < 0 ? 0 : first;
     }
-    out.splice(at, 0, { line: c, field: f });
+    out.splice(at, 0, ...c.map((line) => ({ line, field: f })));
     emitted.add(f);
   }
 
-  // keep duration directly below end
-  const durIdx = out.findIndex((o) => o.field === "duration");
-  const endIdx = out.findIndex((o) => o.field === "end");
-  if (durIdx >= 0 && endIdx >= 0 && durIdx !== endIdx + 1) {
-    const [dur] = out.splice(durIdx, 1);
-    out.splice(out.findIndex((o) => o.field === "end") + 1, 0, dur);
+  // keep duration directly below end, and paused directly below duration
+  for (const [field, above] of [["duration", "end"], ["paused", "duration"]] as const) {
+    const idx = out.findIndex((o) => o.field === field);
+    const aboveIdx = out.findIndex((o) => o.field === above);
+    if (idx >= 0 && aboveIdx >= 0 && idx !== aboveIdx + 1) {
+      const [moved] = out.splice(idx, 1);
+      out.splice(out.findIndex((o) => o.field === above) + 1, 0, moved);
+    }
   }
   return out.map((o) => o.line);
 }
@@ -596,15 +759,30 @@ export function planReplace(
   return b ? editFor(b, update(b.session)) : null;
 }
 
+/** An edit that changes nothing, for a block that is already in the wanted state. */
+const unchangedEdit = (b: FoundBlock): BlockEdit => ({ fromLine: b.openLine + 1, toLine: b.closeLine, lines: [], unchanged: true });
+
 /**
- * The edit that finishes the session at `end`. If the matching block already has an end
- * (for example the user typed one by hand), it is left alone and the edit is marked unchanged.
+ * The edit that finishes the session at `end` (see finishAt). If the matching block already has
+ * an end (for example the user typed one by hand), it is left alone and the edit is marked unchanged.
  */
 export function planFinish(text: string, start: Date, end: Date, dayOf?: Date): BlockEdit | null {
   const b = findBlockByStart(text, start, dayOf);
   if (!b) return null;
-  if (b.session.end) return { fromLine: b.openLine + 1, toLine: b.closeLine, lines: [], unchanged: true };
-  return editFor(b, { ...b.session, end });
+  if (b.session.end) return unchangedEdit(b);
+  return editFor(b, finishAt(b.session, end));
+}
+
+/**
+ * The edit that applies `change` to a running session (pauseAt, resumeAt, addBreak…).
+ * Finished blocks are never touched, and a change that returns the same session is marked unchanged.
+ */
+export function planChange(text: string, start: Date, change: (current: Session) => Session, dayOf?: Date): BlockEdit | null {
+  const b = findBlockByStart(text, start, dayOf);
+  if (!b) return null;
+  if (b.session.end) return unchangedEdit(b);
+  const next = change(b.session);
+  return next === b.session ? unchangedEdit(b) : editFor(b, next);
 }
 
 /** Applies an edit to the text. Each untouched line keeps its own line ending (LF or CRLF). */
