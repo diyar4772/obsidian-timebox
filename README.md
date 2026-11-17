@@ -2,7 +2,7 @@
 
 Track how long you work on something, right inside your [Obsidian](https://obsidian.md) notes.
 
-Start a session and a small code block is inserted into your note. It renders as a **session bar**: the topic, the start time and a live timer. When you finish, the end time and total duration are written into the note too. You can also run a session in **pomodoro** mode, with focus and break phases and an alert whenever the phase changes.
+Start a session and a small code block is inserted into your note. It renders as a **session bar**: the topic, the start time and a live timer. When you finish, the end time and total duration are written into the note too. Pause it for a coffee break and the break isn't counted. You can also run a session in **pomodoro** mode, with focus and break phases and an alert whenever the phase changes.
 
 Everything is stored as plain text in the note itself, so your sessions stay readable even without the plugin.
 
@@ -18,7 +18,7 @@ Everything is stored as plain text in the note itself, so your sessions stay rea
 - Optional **pomodoro mode**: a phase progress bar, `🍅 Pomodoro 2 · Focus · 12:47 left`, green during breaks
 - An on-screen notice, a short beep and (optionally) a system notification when the phase changes
 - The active session in the status bar; click it to open the session's note (with several sessions, a menu lists them all)
-- Survives restarts: the pomodoro phase is calculated from the time elapsed since the start, so no timer state is stored
+- Survives restarts: the timer and the pomodoro phase are calculated from the start time and the breaks written in the block, so no timer state is stored
 - You can write or edit blocks by hand; several date formats are supported
 - Works with light and dark mode and community themes, on desktop and mobile
 
@@ -45,16 +45,19 @@ Everything is stored as plain text in the note itself, so your sessions stay rea
    - If you leave it empty, the note name is used.
 4. When you're done, select **Finish** on the bar or run **Finish active session**.
 
+If the cursor line is empty, the block replaces it; otherwise the block goes on the line below. The cursor then moves below the block so you can keep typing.
+
+Starting a new session automatically finishes any session that's still open, at the current time. You can turn this off in the settings to run several sessions at once; clicking the status bar then lists all of them, and **Choose a session to finish** asks which one to finish.
+
 ### Breaks
 
 - Select **Pause** on the bar (or run **Pause or resume active session**). The timer stops, the bar turns orange and shows `Paused for 04:13 · Breaks: 16m 5s`. Select **Resume** to carry on.
 - Forgot to pause? Open the **⋯** menu on the bar and choose **Add a break…** (e.g. "the last 15 minutes"), or **Finish at an earlier time…** if you stopped working a while ago.
 - If the computer sleeps or Obsidian is closed while a session runs, you're asked on return whether that time was a break.
 - A session that has been running for 3 hours reminds you. You can change the limit, or have the session paused or finished instead, in the settings.
+- Finishing a paused session ends it at the moment you paused.
 
-If the cursor line is empty, the block replaces it; otherwise the block goes on the line below. The cursor then moves below the block so you can keep typing.
-
-Starting a new session automatically finishes any session that's still open, at the current time. You can turn this off in the settings.
+![Session bars while paused: a simple session and a pomodoro session showing how long the break has lasted, and a finished session with its total break time](docs/images/breaks.png)
 
 ## Block format
 
@@ -197,8 +200,11 @@ Your sessions live only in your notes, inside the code blocks. The plugin's own 
 **Can I edit a block by hand?**
 Yes. You can change the start, end or topic, and add your own lines inside the block. An open session you write by hand is picked up as an active session when the note is displayed.
 
+**I updated from 1.0. What changes in my notes?**
+Nothing until a session is paused or finished. From 1.1, `duration` is the time worked with breaks taken out; sessions without breaks get the same duration as before, and no `paused:` line is added to them.
+
 **Does it work on mobile?**
-Yes. Mobile has no status bar and no system notifications; the bar, the commands and the pomodoro phases all work.
+Yes. Mobile has no status bar and no system notifications; the bar, the buttons, the commands and the pomodoro phases all work.
 
 ## Development
 
